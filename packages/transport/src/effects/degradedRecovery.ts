@@ -10,8 +10,10 @@ export interface DegradedRecoveryOptions {
   readonly ensureAll: () => void;
   readonly probe: () => Promise<BackgroundProbeOutcome>;
   readonly graceMs?: number;
+  readonly isReachable?: () => boolean;
   readonly onEscalate?: (round: number) => void;
   readonly onOffline?: (reason: string) => void;
+  readonly onHold?: (reason: string) => void;
 }
 
 const DEFAULT_GRACE_MS = 10_000;
@@ -46,6 +48,15 @@ export function attachDegradedRecovery(options: DegradedRecoveryOptions): Detach
     const outcome = await options.probe();
     if (detached || options.signal.current.kind !== 'degraded') return;
     if (outcome === 'failed') {
+      // a failed probe is a false negative when a channel already reconnected
+      // to the same endpoint: on a cold-radio wake the HTTP probe can time out
+      // while nats is back up. tearing down here would kill a healed
+      // connection. Hold, and let the still-down channel recover on its own
+      if (options.isReachable?.()) {
+        options.onHold?.('probe failed but a channel is up — holding');
+        arm();
+        return;
+      }
       options.onOffline?.('degraded: endpoint unreachable');
       options.kernel.dispatch({ type: 'PROBE_FAILED_ALL', error: 'degraded: endpoint unreachable' });
       return;

@@ -11,6 +11,7 @@ import type { BackgroundProbeOutcome } from '../backgroundProbe.js';
 const LAN: Endpoint = { url: 'https://lan.local', mode: 'direct-lan' };
 const TOKENS: Tokens = { access: 'at' };
 const SOCKETIO_SPEC: TransportSpec = { id: 'socketio', kind: 'persistent', phaseGating: true };
+const NATS_SPEC: TransportSpec = { id: 'nats', kind: 'persistent', phaseGating: true };
 
 function makeCtx(): ReducerContext {
   return { now: () => Date.now() };
@@ -29,6 +30,21 @@ async function setup(probeOutcomes: BackgroundProbeOutcome[]) {
   const detach = attachDegradedRecovery({ kernel, signal, ensureAll, probe, graceMs: 1_000 });
   await socketio.apply({ endpoint: LAN, tokens: TOKENS });
   return { kernel, socketio, signal, ensureAll, probe, detach };
+}
+
+async function setupPair(probeOutcomes: BackgroundProbeOutcome[]) {
+  const kernel = createKernel({ context: makeCtx(), initial: onlinePhase() });
+  const socketio = new FakeTransport({ spec: SOCKETIO_SPEC });
+  const nats = new FakeTransport({ spec: NATS_SPEC });
+  const signal = createConnectionSignal({ kernel, transports: [socketio, nats], debounceMs: 100 });
+  const ensureAll = vi.fn();
+  const probe = vi.fn(async () => probeOutcomes.shift() ?? ('same' as BackgroundProbeOutcome));
+  const onHold = vi.fn();
+  const isReachable = () => [socketio, nats].some((t) => t.health().up);
+  const detach = attachDegradedRecovery({ kernel, signal, ensureAll, probe, graceMs: 1_000, isReachable, onHold });
+  await socketio.apply({ endpoint: LAN, tokens: TOKENS });
+  await nats.apply({ endpoint: LAN, tokens: TOKENS });
+  return { kernel, socketio, nats, signal, ensureAll, probe, onHold, detach };
 }
 
 beforeEach(() => {
@@ -112,5 +128,37 @@ describe('attachDegradedRecovery', () => {
     expect(ensureAll).not.toHaveBeenCalled();
     expect(probe).not.toHaveBeenCalled();
     expect(kernel.phase.kind).toBe('online');
+  });
+
+  it('probe failed but a channel is still up → holds online and re-arms (false-negative on cold-radio wake)', async () => {
+    const { kernel, socketio, probe, onHold, detach } = await setupPair(['failed']);
+
+    socketio.emitDown('gone'); // socketio down, nats stays up → degraded but reachable
+    await vi.advanceTimersByTimeAsync(150);
+    expect(kernel.phase.kind).toBe('online');
+
+    await vi.advanceTimersByTimeAsync(1_000); // round 1: probe fails, but nats is up
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(onHold).toHaveBeenCalledTimes(1);
+    expect(kernel.phase.kind).toBe('online'); // held, not torn down
+
+    await vi.advanceTimersByTimeAsync(1_000); // re-armed → escalates again
+    expect(probe).toHaveBeenCalledTimes(2);
+    expect(kernel.phase.kind).toBe('online');
+    detach();
+  });
+
+  it('probe failed and no channel up → still PROBE_FAILED_ALL (guard does not mask a real outage)', async () => {
+    const { kernel, socketio, nats, onHold, detach } = await setupPair(['failed']);
+
+    socketio.emitDown('gone');
+    nats.emitDown('gone'); // both down → genuinely unreachable
+    await vi.advanceTimersByTimeAsync(150);
+    expect(kernel.phase.kind).toBe('online');
+
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(kernel.phase.kind).toBe('offline');
+    expect(onHold).not.toHaveBeenCalled();
+    detach();
   });
 });
