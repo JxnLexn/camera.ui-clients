@@ -7,11 +7,13 @@ export type RefreshReason = 'proactive' | 'auth-error';
 export interface TokenLifecycleOptions {
   readonly kernel: Kernel;
   readonly transports: readonly Transport[];
-  readonly refresh: (target: ConnectionTarget, reason: RefreshReason) => Promise<Tokens>;
   readonly graceMs?: number;
-  readonly isTransientError?: (err: unknown) => boolean;
   readonly maxTransientRetries?: number;
   readonly transientRetryDelayMs?: number;
+  readonly maxServerErrorRetries?: number;
+  readonly refresh: (target: ConnectionTarget, reason: RefreshReason) => Promise<Tokens>;
+  readonly isTransientError?: (err: unknown) => boolean;
+  readonly isServerError?: (err: unknown) => boolean;
   readonly now?: () => number;
   readonly setTimer?: (cb: () => void, ms: number) => unknown;
   readonly clearTimer?: (handle: unknown) => void;
@@ -20,7 +22,7 @@ export interface TokenLifecycleOptions {
   readonly onRefreshStart?: (reason: RefreshReason) => void;
   readonly onRefreshSuccess?: (reason: RefreshReason, tokens: Tokens) => void;
   readonly onRefreshSkipped?: (reason: RefreshReason, tokens: Tokens) => void;
-  readonly onRefreshError?: (reason: RefreshReason, error: unknown, info: { transient: boolean; retriesLeft: number; willRetry: boolean }) => void;
+  readonly onRefreshError?: (reason: RefreshReason, error: unknown, info: { transient: boolean; serverError: boolean; retriesLeft: number; willRetry: boolean }) => void;
   readonly onScheduled?: (delayMs: number, expiresAt: number) => void;
   readonly onWakeChecked?: (info: { decision: 'refresh-now' | 'still-fresh' | 'no-target' | 'no-expiry'; remainingMs?: number; phase: string }) => void;
   readonly onTriggerSkipped?: (reason: RefreshReason, why: 'detached' | 'already-inflight' | 'no-target', phase: string) => void;
@@ -40,9 +42,11 @@ const MAX_TIMER_DELAY_MS = 2 ** 31 - 1;
 
 export function attachTokenLifecycle(options: TokenLifecycleOptions): TokenLifecycle {
   const graceMs = options.graceMs ?? DEFAULT_GRACE_MS;
-  const isTransient = options.isTransientError ?? (() => false);
   const maxTransientRetries = options.maxTransientRetries ?? DEFAULT_MAX_TRANSIENT_RETRIES;
+  const maxServerErrorRetries = options.maxServerErrorRetries ?? maxTransientRetries;
   const transientRetryDelayMs = options.transientRetryDelayMs ?? DEFAULT_TRANSIENT_RETRY_DELAY_MS;
+  const isTransient = options.isTransientError ?? (() => false);
+  const isServerError = options.isServerError ?? (() => false);
   const now = options.now ?? (() => Date.now());
   const setTimer = options.setTimer ?? ((cb, ms) => setTimeout(cb, ms));
   const clearTimer = options.clearTimer ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>));
@@ -148,10 +152,15 @@ export function attachTokenLifecycle(options: TokenLifecycleOptions): TokenLifec
     } catch (err) {
       if (detached) return;
       const transient = isTransient(err);
-      if (transient && transientRetries < maxTransientRetries) {
+      // a server error (5xx) is still transient (→ offline, not needs-auth) but
+      // gets the smaller server-error budget: retrying the token refresh can't
+      // fix a down server, so give up quickly and let re-discovery take over.
+      const serverError = transient && isServerError(err);
+      const budget = serverError ? maxServerErrorRetries : maxTransientRetries;
+      if (transient && transientRetries < budget) {
         transientRetries++;
-        const retriesLeft = maxTransientRetries - transientRetries;
-        options.onRefreshError?.(reason, err, { transient: true, retriesLeft, willRetry: true });
+        const retriesLeft = budget - transientRetries;
+        options.onRefreshError?.(reason, err, { transient: true, serverError, retriesLeft, willRetry: true });
         cancelTimer();
         timer = setTimer(() => {
           timer = undefined;
@@ -159,9 +168,9 @@ export function attachTokenLifecycle(options: TokenLifecycleOptions): TokenLifec
         }, transientRetryDelayMs);
       } else {
         transientRetries = 0;
-        options.onRefreshError?.(reason, err, { transient, retriesLeft: 0, willRetry: false });
+        options.onRefreshError?.(reason, err, { transient, serverError, retriesLeft: 0, willRetry: false });
         // Tag with the original transience: server-side rejection (401 etc)
-        // → needs-auth; transient retries exhausted (network) → offline.
+        // → needs-auth; transient give-up (network / 5xx) → offline → rediscover.
         options.kernel.dispatch({ type: 'TOKENS_INVALID', reason: stringifyError(err), transient });
       }
     } finally {

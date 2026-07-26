@@ -271,6 +271,53 @@ describe('attachTokenLifecycle — transient errors', () => {
     expect(kernel.phase.kind).toBe('offline');
   });
 
+  it('5xx server error gives up after maxServerErrorRetries, not the full ladder → offline', async () => {
+    const kernel = createKernel({ context: makeCtx(), initial: onlineWith(T0 + 30_000) });
+    const refresh = vi.fn().mockRejectedValue(Object.assign(new Error('530'), { status: 530 }));
+    attachTokenLifecycle({
+      kernel,
+      transports: [],
+      refresh,
+      graceMs: 5_000,
+      transientRetryDelayMs: 1_000,
+      maxTransientRetries: 5,
+      isTransientError: (err: any) => err?.status >= 500,
+      isServerError: (err: any) => err?.status >= 500,
+      maxServerErrorRetries: 1,
+    });
+
+    await vi.advanceTimersByTimeAsync(25_001); // proactive: 5xx #1 → one retry queued
+    expect(kernel.phase.kind).toBe('online');
+    await vi.advanceTimersByTimeAsync(1_001); // retry: 5xx #2 → server-error budget spent
+    expect(refresh).toHaveBeenCalledTimes(2); // not 6 — capped by maxServerErrorRetries
+    // 5xx stays transient → offline (rediscover), never needs-auth
+    expect(kernel.phase.kind).toBe('offline');
+  });
+
+  it('a transient non-server error keeps the full transient budget despite the shortcut', async () => {
+    const kernel = createKernel({ context: makeCtx(), initial: onlineWith(T0 + 30_000) });
+    const refresh = vi.fn().mockRejectedValue(Object.assign(new Error('net'), { status: 0 }));
+    attachTokenLifecycle({
+      kernel,
+      transports: [],
+      refresh,
+      graceMs: 5_000,
+      transientRetryDelayMs: 1_000,
+      maxTransientRetries: 3,
+      isTransientError: () => true,
+      isServerError: (err: any) => err?.status >= 500, // 0 → not a server error
+      maxServerErrorRetries: 1,
+    });
+
+    await vi.advanceTimersByTimeAsync(25_001); // #1
+    await vi.advanceTimersByTimeAsync(1_001); // #2
+    await vi.advanceTimersByTimeAsync(1_001); // #3
+    expect(kernel.phase.kind).toBe('online'); // budget of 3 not spent yet
+    await vi.advanceTimersByTimeAsync(1_001); // #4 → give up
+    expect(refresh).toHaveBeenCalledTimes(4);
+    expect(kernel.phase.kind).toBe('offline');
+  });
+
   it('permanent error bypasses retry and goes straight to needs-auth', async () => {
     const kernel = createKernel({ context: makeCtx(), initial: onlineWith(T0 + 30_000) });
     const refresh = vi.fn().mockRejectedValue(new Error('401'));
