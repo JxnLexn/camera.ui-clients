@@ -216,6 +216,8 @@ export function useCameraStream(options: UseCameraStreamOptions): CameraStream {
     video.muted = true;
     video.disablePictureInPicture = false;
     video.preload = 'auto';
+    video.poster = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=';
+    video.style.backgroundColor = '#000';
     video.style.position = 'absolute';
     video.style.width = '100%';
     video.style.height = '100%';
