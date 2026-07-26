@@ -207,6 +207,56 @@ describe('attachProbeLoop — failure semantics', () => {
   });
 });
 
+describe('attachProbeLoop — cancellation-shaped failures', () => {
+  it('a canceled endpoint does not short-circuit — a healthy candidate still wins', async () => {
+    const probe = vi.fn<ProbeFn>(async (ctx) => {
+      if (ctx.endpoint.url === LAN.url) throw makeProbeFailure('aborted', 'request canceled');
+      await new Promise((r) => setTimeout(r, 20));
+      return TOKENS;
+    });
+    const discover = vi.fn(async () => [LAN, WAN]);
+    const kernel = createKernel({ context: makeCtx(), initial: discoveringPhase() });
+    const detach = attachProbeLoop({ kernel, discover, probe });
+
+    await vi.waitFor(() => expect(kernel.phase.kind).toBe('online'));
+    if (kernel.phase.kind === 'online') {
+      expect(kernel.phase.target.endpoint).toEqual(WAN);
+    }
+    detach();
+  });
+
+  it('canceled + transient → offline with the transient reason, no quick re-run', async () => {
+    const probe = vi.fn<ProbeFn>(async (ctx) => {
+      if (ctx.endpoint.url === LAN.url) throw makeProbeFailure('aborted', 'request canceled');
+      throw makeProbeFailure('transient', 'server down');
+    });
+    const discover = vi.fn(async () => [LAN, WAN]);
+    const kernel = createKernel({ context: makeCtx(), initial: discoveringPhase() });
+    const detach = attachProbeLoop({ kernel, discover, probe });
+
+    await vi.waitFor(() => expect(kernel.phase.kind).toBe('offline'));
+    if (kernel.phase.kind === 'offline') {
+      expect(kernel.phase.lastError).toBe('server down');
+    }
+    await new Promise((r) => setTimeout(r, 250));
+    expect(discover).toHaveBeenCalledTimes(1);
+    detach();
+  });
+
+  it('all canceled → quick re-run instead of offline', async () => {
+    const probe = vi.fn<ProbeFn>(async () => {
+      throw makeProbeFailure('aborted', 'request canceled');
+    });
+    const discover = vi.fn(async () => [LAN, WAN]);
+    const kernel = createKernel({ context: makeCtx(), initial: discoveringPhase() });
+    const detach = attachProbeLoop({ kernel, discover, probe });
+
+    await vi.waitFor(() => expect(discover.mock.calls.length).toBeGreaterThanOrEqual(2), { timeout: 2_000 });
+    expect(kernel.phase.kind).toBe('discovering');
+    detach();
+  });
+});
+
 describe('attachProbeLoop — re-entry + abort', () => {
   it('re-runs discover when phase re-enters discovering via USER_RETRY', async () => {
     const discover = vi.fn(async () => [LAN]);

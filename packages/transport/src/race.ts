@@ -13,11 +13,12 @@ export interface RaceCandidate<T> {
 }
 
 export interface RaceFirstOptions {
+  readonly parentSignal?: AbortSignal;
+  readonly preferGraceMs?: number;
   readonly timeoutByMode?: TimeoutByModeFn;
   readonly shortCircuit?: (err: unknown) => boolean;
-  readonly parentSignal?: AbortSignal;
+  readonly informative?: (cause: unknown) => boolean;
   readonly prefer?: (endpoint: Endpoint) => boolean;
-  readonly preferGraceMs?: number;
 }
 
 const DEFAULT_PREFER_GRACE_MS = 400;
@@ -42,7 +43,7 @@ export class RaceFirstError extends Error {
 }
 
 export function raceFirst<T>(candidates: readonly RaceCandidate<T>[], options: RaceFirstOptions = {}): Promise<RaceFirstResult<T>> {
-  const { timeoutByMode = (mode) => DEFAULT_RACE_TIMEOUT_BY_MODE[mode] ?? 5_000, shortCircuit, parentSignal, prefer } = options;
+  const { timeoutByMode = (mode) => DEFAULT_RACE_TIMEOUT_BY_MODE[mode] ?? 5_000, shortCircuit, informative, parentSignal, prefer } = options;
   const preferGraceMs = options.preferGraceMs ?? DEFAULT_PREFER_GRACE_MS;
 
   return new Promise<RaceFirstResult<T>>((resolve, reject) => {
@@ -67,7 +68,9 @@ export function raceFirst<T>(candidates: readonly RaceCandidate<T>[], options: R
     function cleanupAllExcept(except: AbortController | null): void {
       for (const t of timers) clearTimeout(t);
       for (const a of abortControllers) {
-        if (a !== except) a.abort();
+        // reason lets candidate wrappers tell "race already settled" apart
+        // from "own timer fired" when labeling the rejection
+        if (a !== except) a.abort('race-settled');
       }
     }
 
@@ -111,7 +114,7 @@ export function raceFirst<T>(candidates: readonly RaceCandidate<T>[], options: R
       const ctrl = new AbortController();
       abortControllers.push(ctrl);
       const delay = timeoutByMode(cand.endpoint.mode);
-      const timer = setTimeout(() => ctrl.abort(), delay);
+      const timer = setTimeout(() => ctrl.abort('race-timeout'), delay);
       timers.push(timer);
 
       cand.run(ctrl.signal).then(
@@ -144,14 +147,16 @@ export function raceFirst<T>(candidates: readonly RaceCandidate<T>[], options: R
 
           remaining--;
           if (remaining <= 0) {
-            // Prefer the most informative recent error — first one in iteration
-            // order whose cause is not a vanilla timeout, otherwise just the
-            // last one seen.
-            const informative = [...lastErrors.entries()].find(([, e]) => {
+            // Representative error pick: skip vanilla timeout envelopes, then
+            // prefer causes the caller ranks informative (probeLoop uses this
+            // to keep canceled-request noise from masking a real failure),
+            // otherwise first usable in iteration order.
+            const usable = [...lastErrors.entries()].filter(([, e]) => {
               if (e instanceof RaceFirstError) return e.kind !== 'all-failed' || !(e.cause instanceof Error && e.cause.message === 'aborted');
               return true;
             });
-            const [endpoint, cause] = informative ?? [cand.endpoint, finalErr];
+            const preferred = informative ? usable.find(([, e]) => informative(e instanceof RaceFirstError ? e.cause : e)) : undefined;
+            const [endpoint, cause] = preferred ?? usable[0] ?? [cand.endpoint, finalErr];
             finishFail(new RaceFirstError('raceFirst: all candidates failed', endpoint, cause, 'all-failed'));
           }
         },

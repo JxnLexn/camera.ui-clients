@@ -180,6 +180,89 @@ describe('raceFirst — per-mode timeout', () => {
   });
 });
 
+describe('raceFirst — abort reasons + informative pick', () => {
+  it('losers aborted by a settled race carry reason race-settled', async () => {
+    let loserReason: unknown;
+    const candidates: RaceCandidate<string>[] = [
+      {
+        endpoint: LAN,
+        run: (signal) =>
+          new Promise<string>((_, rej) =>
+            signal.addEventListener('abort', () => {
+              loserReason = (signal as AbortSignal & { reason?: unknown }).reason;
+              rej(new Error('aborted'));
+            }),
+          ),
+      },
+      { endpoint: WAN, run: () => Promise.resolve('win') },
+    ];
+
+    await raceFirst(candidates);
+    await Promise.resolve();
+    expect(loserReason).toBe('race-settled');
+  });
+
+  it('timer-fired aborts carry reason race-timeout', async () => {
+    let reason: unknown;
+    const candidates: RaceCandidate<string>[] = [
+      {
+        endpoint: LAN,
+        run: (signal) =>
+          new Promise<string>((_, rej) =>
+            signal.addEventListener('abort', () => {
+              reason = (signal as AbortSignal & { reason?: unknown }).reason;
+              rej(new Error('to'));
+            }),
+          ),
+      },
+    ];
+
+    const racePromise = raceFirst(candidates, { timeoutByMode: () => 100 });
+    const assertion = expect(racePromise).rejects.toMatchObject({ kind: 'all-failed' });
+    await vi.advanceTimersByTimeAsync(101);
+    expect(reason).toBe('race-timeout');
+    await assertion;
+  });
+
+  it('informative option picks the preferred representative cause on all-failed', async () => {
+    const noise = Object.assign(new Error('request canceled'), { kind: 'aborted' });
+    const candidates: RaceCandidate<string>[] = [
+      { endpoint: LAN, run: () => Promise.reject(noise) },
+      { endpoint: WAN, run: () => Promise.reject(new Error('server down')) },
+    ];
+
+    const err = await raceFirst(candidates, {
+      informative: (cause) => (cause as { kind?: string }).kind !== 'aborted',
+    }).then(
+      () => null,
+      (e) => e as RaceFirstError,
+    );
+
+    expect(err!.kind).toBe('all-failed');
+    expect((err!.cause as Error).message).toBe('server down');
+    expect(err!.endpoint).toEqual(WAN);
+  });
+
+  it('falls back to the first usable error when nothing is informative', async () => {
+    const noiseA = Object.assign(new Error('canceled-a'), { kind: 'aborted' });
+    const noiseB = Object.assign(new Error('canceled-b'), { kind: 'aborted' });
+    const candidates: RaceCandidate<string>[] = [
+      { endpoint: LAN, run: () => Promise.reject(noiseA) },
+      { endpoint: WAN, run: () => Promise.reject(noiseB) },
+    ];
+
+    const err = await raceFirst(candidates, {
+      informative: (cause) => (cause as { kind?: string }).kind !== 'aborted',
+    }).then(
+      () => null,
+      (e) => e as RaceFirstError,
+    );
+
+    expect(err!.kind).toBe('all-failed');
+    expect((err!.cause as Error).message).toBe('canceled-a');
+  });
+});
+
 describe('raceFirst — LAN preference', () => {
   const LAN_EP: Endpoint = { url: 'https://lan.local', mode: 'direct-lan' };
   const WAN_EP: Endpoint = { url: 'https://wan.example', mode: 'direct-wan' };

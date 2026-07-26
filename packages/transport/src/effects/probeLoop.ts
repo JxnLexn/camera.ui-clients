@@ -100,12 +100,19 @@ export function attachProbeLoop(options: ProbeLoopOptions): Detach {
           options.onProbeSuccess?.(endpoint, tokens);
           return tokens;
         } catch (err) {
-          // Translate per-candidate timeout (signal aborted, no typed kind)
-          // into a typed `transient` so downstream logging + the
-          // `shortCircuit` predicate below agree.
-          const isLocalTimeout = signal.aborted && !ctrl.signal.aborted && !isProbeFailure(err);
-          const timeout = (options.timeoutByMode ?? ((m) => DEFAULT_RACE_TIMEOUT_BY_MODE[m] ?? 5_000))(endpoint.mode);
-          const finalErr = isLocalTimeout ? makeProbeFailure('transient', `timeout (${timeout}ms)`) : err;
+          // Translate per-candidate aborts (signal aborted, no typed kind)
+          // into typed `transient` failures. The signal reason separates the
+          // candidate's own timer from cleanup after the race settled — a
+          // candidate canceled at 80ms must not be logged as a 2s timeout.
+          let finalErr = err;
+          if (signal.aborted && !ctrl.signal.aborted && !isProbeFailure(err)) {
+            if ((signal as AbortSignal & { reason?: unknown }).reason === 'race-settled') {
+              finalErr = makeProbeFailure('transient', 'superseded');
+            } else {
+              const timeout = (options.timeoutByMode ?? ((m) => DEFAULT_RACE_TIMEOUT_BY_MODE[m] ?? 5_000))(endpoint.mode);
+              finalErr = makeProbeFailure('transient', `timeout (${timeout}ms)`);
+            }
+          }
           options.onProbeError?.(endpoint, finalErr);
           throw finalErr;
         }
@@ -119,10 +126,14 @@ export function attachProbeLoop(options: ProbeLoopOptions): Detach {
         prefer: options.prefer,
         preferGraceMs: options.preferGraceMs,
         // needs-auth/fatal short-circuit because the same tokens (or lack
-        // thereof) reject every endpoint in this pool. `aborted` short-
-        // circuits because external cancellation (browser navigation, SW)
-        // affects all in-flight requests synchronously.
-        shortCircuit: (err) => isProbeFailure(err) && (err.kind === 'needs-auth' || err.kind === 'fatal' || err.kind === 'aborted'),
+        // thereof) reject every endpoint in this pool. `aborted` deliberately
+        // does NOT: Android's WebView rejects cert-blocked requests with
+        // cancellation-shaped errors, and one poisoned endpoint must not kill
+        // a healthy candidate mid-flight.
+        shortCircuit: (err) => isProbeFailure(err) && (err.kind === 'needs-auth' || err.kind === 'fatal'),
+        // canceled-request noise loses the representative-error pick, so the
+        // quick re-run below only triggers when ALL candidates were canceled
+        informative: (cause) => !(isProbeFailure(cause) && cause.kind === 'aborted'),
       });
       if (ctrl.signal.aborted) return;
       options.kernel.dispatch({ type: 'PROBE_SUCCEEDED', endpoint, tokens });
