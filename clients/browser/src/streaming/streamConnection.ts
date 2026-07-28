@@ -8,7 +8,7 @@ import { useTabVisibility } from '../composables/useTabVisibility.js';
 import { createSourceName } from '../server/index.js';
 import { STREAM_CONFIG } from './config.js';
 import { createMSEHandler, playVideo } from './mse.js';
-import { abortableSleep, checkWebRTCCompatibility } from './utils.js';
+import { abortableSleep, canPlayH265, checkWebRTCCompatibility, reportH265DecodeFailure } from './utils.js';
 import { createBackchannelHandler, createWebRTCHandler, processWebRTCMessage } from './webrtc.js';
 
 import type { CameraSource, ProbeStream, StreamingRole } from '@camera.ui/sdk';
@@ -17,7 +17,7 @@ import type { WsHandle, WsTransport } from '@camera.ui/transport/transports/ws';
 import type { ComputedRef, MaybeRefOrGetter, Ref, ShallowRef } from 'vue';
 import type { ReactiveCameraDevice } from '../types.js';
 import type { MSEHandler } from './mse.js';
-import type { Go2RTCMessage, ReactiveStream, StreamStatus, VideoStreamingMode } from './types.js';
+import type { Go2RTCMessage, ReactiveStream, StreamDegradeReason, StreamStatus, VideoStreamingMode } from './types.js';
 import type { BackchannelHandler, WebRTCHandler } from './webrtc.js';
 
 export interface StreamConnectionOptions {
@@ -37,6 +37,8 @@ export class StreamConnection implements ReactiveStream {
   public readonly requestedMode: Ref<VideoStreamingMode>;
   public readonly activeResolution: Ref<StreamingRole>;
   public readonly requestedResolution: Ref<StreamingRole>;
+  public readonly degradedFrom: Ref<StreamingRole | null>;
+  public readonly degradeReason: Ref<StreamDegradeReason | null>;
   public readonly source: ShallowRef<CameraSource | undefined>;
   public readonly hasVideo: Ref<boolean>;
   public readonly hasAudio: Ref<boolean>;
@@ -49,15 +51,21 @@ export class StreamConnection implements ReactiveStream {
   public readonly nativeWidth: Ref<number>;
   public readonly nativeHeight: Ref<number>;
 
+  private readonly camera: ComputedRef<ReactiveCameraDevice | undefined>;
+  private readonly videoElement: ComputedRef<HTMLVideoElement | undefined | null>;
+  private readonly containerElement: ComputedRef<HTMLElement | undefined | null>;
+  private readonly target: Readonly<Ref<ConnectionTarget | null>>;
+  private readonly isReady: ComputedRef<boolean>;
+  private readonly effectiveMode: ComputedRef<Exclude<VideoStreamingMode, 'auto'>>;
+  private readonly triedSourceIds = new Set<string>();
   private readonly options: StreamConnectionOptions;
+  private readonly wsTransport: WsTransport;
+  private readonly scope = effectScope(true);
 
   private connectionGeneration = 0;
   private abortController = new AbortController();
-  private readonly scope = effectScope(true);
-  private offTabVisible: (() => void) | undefined;
-  private offTabPaused: (() => void) | undefined;
+  private probedSourceId: string | undefined;
   private wasPausedByVisibility = false;
-  private readonly wsTransport: WsTransport;
   private wsHandle: WsHandle | undefined;
   private webrtcHandler: WebRTCHandler | undefined;
   private mseHandler: MSEHandler | undefined;
@@ -67,17 +75,12 @@ export class StreamConnection implements ReactiveStream {
   private lastMediaStream: MediaStream | null = null;
   private stopWatchers: (() => void)[] = [];
   private mseMonitorInterval: ReturnType<typeof setInterval> | undefined;
+
+  private offTabVisible: (() => void) | undefined;
+  private offTabPaused: (() => void) | undefined;
   private onVideoPauseBound: (() => void) | undefined;
   private onVideoPlayBound: (() => void) | undefined;
   private onVideoResizeBound: (() => void) | undefined;
-
-  private readonly camera: ComputedRef<ReactiveCameraDevice | undefined>;
-  private readonly videoElement: ComputedRef<HTMLVideoElement | undefined | null>;
-  private readonly containerElement: ComputedRef<HTMLElement | undefined | null>;
-  private readonly target: Readonly<Ref<ConnectionTarget | null>>;
-  private readonly isReady: ComputedRef<boolean>;
-  private readonly effectiveMode: ComputedRef<Exclude<VideoStreamingMode, 'auto'>>;
-
   private startWsConnectTimeout!: () => void;
   private stopWsConnectTimeout!: () => void;
   private startConnectTimeout!: () => void;
@@ -102,6 +105,8 @@ export class StreamConnection implements ReactiveStream {
     this.status = ref<StreamStatus>('idle');
     this.activeMode = ref<Exclude<VideoStreamingMode, 'auto'>>('webrtc');
     this.activeResolution = ref<StreamingRole>('low-resolution');
+    this.degradedFrom = ref<StreamingRole | null>(null);
+    this.degradeReason = ref<StreamDegradeReason | null>(null);
     this.source = shallowRef<CameraSource | undefined>();
     this.hasVideo = ref(false);
     this.hasAudio = ref(false);
@@ -147,9 +152,6 @@ export class StreamConnection implements ReactiveStream {
         () => {
           if (this.webrtcHandler && !this.webrtcHandler.isConnected) {
             if (this.requestedMode.value === 'auto') {
-              // The failed handler must go — a lingering reference would
-              // swallow setMicrophone() (backchannel never starts) and eat
-              // the backchannel's webrtc/answer frames.
               this.webrtcHandler.close();
               this.webrtcHandler = undefined;
               this.activeMode.value = 'mse';
@@ -159,20 +161,22 @@ export class StreamConnection implements ReactiveStream {
                 this.startMSE();
               }
             } else {
+              this.markSourceUndecodable();
               this.restart();
             }
+          } else if (this.status.value === 'connected' && !this.isPlaying.value && !this.abortController.signal.aborted && this.sourceLikelyH265()) {
+            this.handleNoFramesWhileConnected();
           }
         },
         STREAM_CONFIG.WEBRTC.CONNECT_TIMEOUT,
         { immediate: false },
       );
 
-      // The MSE path has no other deadline: if the server never answers the
-      // `mse` request, the stream would sit in 'connecting' forever.
       const mseConnectTimeout = useTimeoutFn(
         () => {
           if (this.abortController.signal.aborted || this.status.value === 'connected' || this.status.value === 'closed') return;
           if (this.mseHandler && !this.mseHandler.isReady) {
+            this.markSourceUndecodable();
             this.restart();
           }
         },
@@ -253,29 +257,56 @@ export class StreamConnection implements ReactiveStream {
     this.abortController = new AbortController();
     const gen = ++this.connectionGeneration;
 
+    this.triedSourceIds.clear();
     this.status.value = 'connecting';
     this.error.value = undefined;
     this.isPlaying.value = false;
 
     try {
-      if (!this.initializeSource()) {
+      const init = this.initializeSource();
+      if (init === 'unsupported') {
+        log.debug('start() — no source with a playable codec');
+        this.setUnsupported();
+        return;
+      }
+      if (!init) {
         log.debug('start() — no streaming source available');
         this.error.value = new Error('No streaming source available');
         this.status.value = 'error';
         return;
       }
 
-      await this.probeStream();
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const probedSourceId = this.source.value?._id;
+        const probe = await this.probeStream();
 
-      // Stale check: restart()/stop() have started a new generation
-      if (gen !== this.connectionGeneration) {
-        log.debug('start() — generation stale after probe, aborting');
-        return;
+        // Stale check: restart()/stop() have started a new generation
+        if (gen !== this.connectionGeneration) {
+          log.debug('start() — generation stale after probe, aborting');
+          return;
+        }
+
+        // The probe is authoritative for this source — taint before
+        // connecting instead of waiting for the no-frames timeout.
+        if (probe && probedSourceId && this.probeSaysUnplayable(probe)) {
+          this.triedSourceIds.add(probedSourceId);
+        }
+
+        const reinit = this.initializeSource();
+        if (reinit === 'unsupported') {
+          this.setUnsupported();
+          return;
+        }
+        if (!reinit) {
+          this.error.value = new Error('No streaming source available');
+          this.status.value = 'error';
+          return;
+        }
+
+        // settled on the probed source, or probe failed — connect and let
+        // the runtime net catch a wrong guess
+        if (!probe || this.source.value?._id === probedSourceId) break;
       }
-
-      // Re-resolve source in case resolution changed during the async probe
-      // (setResolution updates the refs but no longer restarts during 'connecting')
-      this.initializeSource();
 
       log.debug('start() — connecting WebSocket');
       this.connectWebSocket();
@@ -304,6 +335,14 @@ export class StreamConnection implements ReactiveStream {
     this.requestedMode.value = mode;
     this.activeMode.value = mode === 'auto' ? 'webrtc' : mode;
 
+    // A mode switch changes codec playability (MSE vs WebRTC H.265 support
+    // differ) — re-evaluate from scratch when stuck in 'unsupported'.
+    if (this.status.value === 'unsupported') {
+      this.stop();
+      await this.start();
+      return;
+    }
+
     // Only restart if already connected — during 'connecting', start() will
     // pick up the updated refs naturally when it reaches handleWsOpen().
     if (this.status.value === 'connected') {
@@ -316,11 +355,19 @@ export class StreamConnection implements ReactiveStream {
 
     this.requestedResolution.value = resolution;
 
+    if (this.status.value === 'unsupported') {
+      this.stop();
+      await this.start();
+      return;
+    }
+
     const result = this.getSourceForResolution(resolution);
 
-    if (result && result.source._id !== this.source.value?._id) {
+    if (result && result !== 'unsupported' && result.source._id !== this.source.value?._id) {
       this.source.value = result.source;
       this.activeResolution.value = result.effectiveResolution;
+      this.degradedFrom.value = result.degradedFrom;
+      this.degradeReason.value = result.degradedFrom ? 'codec' : null;
 
       // Only restart if already connected — during 'connecting', start()
       // re-reads the source before connectWebSocket().
@@ -425,7 +472,12 @@ export class StreamConnection implements ReactiveStream {
     }
 
     try {
-      if (!this.initializeSource()) {
+      const init = this.initializeSource();
+      if (init === 'unsupported') {
+        this.setUnsupported();
+        return;
+      }
+      if (!init) {
         this.error.value = new Error('No streaming source available');
         this.status.value = 'error';
         return;
@@ -464,6 +516,18 @@ export class StreamConnection implements ReactiveStream {
       },
     );
     this.stopWatchers.push(stopAuthWatch);
+
+    // camera updates swap the inner refs, not the device object — a stream
+    // stuck in 'unsupported' re-evaluates when source metadata changes
+    const stopSourcesWatch = watch(
+      () => this.camera.value?.sources.value,
+      () => {
+        if (this.status.value !== 'unsupported') return;
+        this.stop();
+        this.start();
+      },
+    );
+    this.stopWatchers.push(stopSourcesWatch);
 
     const stopModeWatch = watch(
       () => toValue(this.options.mode),
@@ -542,6 +606,11 @@ export class StreamConnection implements ReactiveStream {
           if (newCamera && newVideo && newClient) {
             this.restart();
           }
+        } else if (this.status.value === 'unsupported' && newCamera && newVideo && newClient) {
+          // camera update may carry corrected codec metadata — re-evaluate;
+          // if nothing changed this lands back in 'unsupported' without connecting
+          this.stop();
+          this.start();
         }
       } else if (newVideo !== oldVideo && newVideo) {
         if (newVideo.srcObject instanceof MediaStream) {
@@ -588,54 +657,116 @@ export class StreamConnection implements ReactiveStream {
     this.stopWatchers.push(stopCameraWatch);
   }
 
+  private isSourcePlayable(source: CameraSource): boolean {
+    if (this.triedSourceIds.has(source._id)) return false;
+    if (source.videoCodec !== 'H265') return true;
+
+    const mode = this.requestedMode.value;
+    if (mode === 'auto') return canPlayH265('auto');
+    if (mode === 'mse') return canPlayH265('mse');
+    return canPlayH265('webrtc');
+  }
+
   // prettier-ignore
   private getSourceForResolution(resolution: StreamingRole):
     | {
       source: CameraSource;
       effectiveResolution: StreamingRole;
+      degradedFrom: StreamingRole | null;
     }
+    | 'unsupported'
     | undefined {
     const cam = this.camera.value;
     if (!cam) return undefined;
 
     const resolutionOrder: StreamingRole[] = ['high-resolution', 'mid-resolution', 'low-resolution'];
+    const startIndex = Math.max(0, resolutionOrder.indexOf(resolution));
 
-    const exactSource = cam.sources.value.find((s) => s.role === resolution);
-    if (exactSource) {
-      return { source: exactSource, effectiveResolution: resolution };
-    }
-
-    const startIndex = resolutionOrder.indexOf(resolution);
+    let skippedUnplayable = false;
     for (let i = startIndex; i < resolutionOrder.length; i++) {
       const src = cam.sources.value.find((s) => s.role === resolutionOrder[i]);
-      if (src) {
-        return { source: src, effectiveResolution: resolutionOrder[i] };
+      if (!src) continue;
+      if (!this.isSourcePlayable(src)) {
+        skippedUnplayable = true;
+        continue;
       }
+      return { source: src, effectiveResolution: resolutionOrder[i], degradedFrom: skippedUnplayable ? resolution : null };
     }
 
     const fallback = cam.streamSource.value;
-    if (fallback) {
-      return { source: fallback, effectiveResolution: (fallback.role as StreamingRole) ?? 'low-resolution' };
+    if (fallback && this.isSourcePlayable(fallback)) {
+      return { source: fallback, effectiveResolution: (fallback.role as StreamingRole) ?? 'low-resolution', degradedFrom: skippedUnplayable ? resolution : null };
     }
 
+    // sources exist but none is decodable here — terminal, not "no source"
+    if (skippedUnplayable || fallback) return 'unsupported';
     return undefined;
   }
 
-  private initializeSource(): boolean {
+  private initializeSource(): boolean | 'unsupported' {
     const result = this.getSourceForResolution(this.requestedResolution.value);
     if (!result) return false;
+    if (result === 'unsupported') return 'unsupported';
 
     this.source.value = result.source;
     this.activeResolution.value = result.effectiveResolution;
+    this.degradedFrom.value = result.degradedFrom;
+    this.degradeReason.value = result.degradedFrom ? 'codec' : null;
+
+    if (this.probedSourceId && this.probedSourceId !== result.source._id) {
+      this.probeInfo.value = undefined;
+      this.probedSourceId = undefined;
+      this.hasVideo.value = false;
+      this.hasAudio.value = false;
+      this.hasBackchannel.value = false;
+    }
     return true;
+  }
+
+  private setUnsupported(): void {
+    const cam = this.camera.value;
+    const codec = cam?.sources.value.find((s) => s.videoCodec)?.videoCodec ?? 'H265';
+    this.error.value = new Error(`${codec} cannot be played on this device`);
+    this.status.value = 'unsupported';
+  }
+
+  private probeSaysUnplayable(probe: ProbeStream): boolean {
+    const video = probe.video.filter((v) => v.direction === 'sendonly');
+    if (!video.length) return false;
+    if (!video.every((v) => v.codec === 'H265')) return false;
+    const mode = this.requestedMode.value;
+    return !canPlayH265(mode === 'auto' ? 'auto' : mode === 'mse' ? 'mse' : 'webrtc');
+  }
+
+  private sourceLikelyH265(): boolean {
+    const src = this.source.value;
+    if (!src) return false;
+    if (src.videoCodec === 'H265') return true;
+    if (src.videoCodec !== undefined) return false;
+
+    const video = this.probeInfo.value?.video.filter((v) => v.direction === 'sendonly') ?? [];
+    return video.length > 0 && video.every((v) => v.codec === 'H265');
+  }
+
+  private markSourceUndecodable(): void {
+    const src = this.source.value;
+    if (!src || !this.sourceLikelyH265()) return;
+    this.triedSourceIds.add(src._id);
+  }
+
+  private handleNoFramesWhileConnected(): void {
+    reportH265DecodeFailure(this.activeMode.value === 'mse' ? 'mse' : 'webrtc');
+    this.markSourceUndecodable();
+    this.restart();
   }
 
   private async probeStream(): Promise<ProbeStream | undefined> {
     const cam = this.camera.value;
-    if (!cam || !this.source.value || this.abortController.signal.aborted) return undefined;
+    const source = this.source.value;
+    if (!cam || !source || this.abortController.signal.aborted) return undefined;
 
     try {
-      const probe = await cam.probeStream(this.source.value._id, {
+      const probe = await cam.probeStream(source._id, {
         video: true,
         audio: ['pcma', 'opus'],
         microphone: true,
@@ -643,6 +774,7 @@ export class StreamConnection implements ReactiveStream {
 
       if (probe && !this.abortController.signal.aborted) {
         this.probeInfo.value = probe;
+        this.probedSourceId = source._id;
         this.hasBackchannel.value = probe.audio.some((a) => a.direction === 'recvonly');
         this.hasAudio.value = probe.audio.filter((a) => a.direction === 'sendonly').length > 0;
         this.hasVideo.value = probe.video.filter((v) => v.direction === 'sendonly').length > 0;
@@ -787,7 +919,8 @@ export class StreamConnection implements ReactiveStream {
     const video = this.videoElement.value;
     if (!video) return;
 
-    this.stopConnectTimeout();
+    // connectTimeout keeps running as a first-frame watchdog (a connected
+    // H.265 track can still decode to nothing) — handleFirstFrame stops it
     this.activeMode.value = this.requestedMode.value === 'auto' ? 'webrtc' : (this.requestedMode.value as 'webrtc' | 'webrtc/tcp');
 
     this.lastMediaStream = stream;
@@ -923,6 +1056,7 @@ export class StreamConnection implements ReactiveStream {
 
   private handleFirstFrame(): void {
     if (!this.isPlaying.value && !this.abortController.signal.aborted) {
+      this.stopConnectTimeout();
       this.isPlaying.value = true;
     }
   }

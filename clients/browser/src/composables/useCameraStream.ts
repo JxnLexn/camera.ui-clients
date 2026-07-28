@@ -42,6 +42,8 @@ export interface CameraStream {
   readonly isPlaying: Ref<boolean>;
   readonly activeMode: Ref<'webrtc' | 'webrtc/tcp' | 'mse'>;
   readonly activeResolution: Ref<StreamingRole>;
+  readonly degradedFrom: Ref<StreamingRole | null>;
+  readonly unsupported: Ref<boolean>;
   readonly hasAudio: Ref<boolean>;
   readonly hasBackchannel: Ref<boolean>;
   readonly error: Ref<Error | undefined>;
@@ -164,11 +166,13 @@ export function useCameraStream(options: UseCameraStreamOptions): CameraStream {
   const isPlaying = computed(() => currentStream.value?.isPlaying.value ?? false);
   const activeMode = computed<'webrtc' | 'webrtc/tcp' | 'mse'>(() => currentStream.value?.activeMode.value ?? 'webrtc');
   const activeResolution = computed<StreamingRole>(() => currentStream.value?.activeResolution.value ?? 'low-resolution');
+  const degradedFrom = computed(() => currentStream.value?.degradedFrom.value ?? null);
+  const unsupported = computed(() => status.value === 'unsupported');
   const hasAudio = computed(() => currentStream.value?.hasAudio.value ?? false);
   const hasBackchannel = computed(() => currentStream.value?.hasBackchannel.value ?? false);
   const error = computed(() => currentStream.value?.error.value);
   const isReconnecting = computed(() => status.value === 'reconnecting');
-  const isBusy = computed(() => cameraDeviceLoading.value || (!isPlaying.value && status.value !== 'error'));
+  const isBusy = computed(() => cameraDeviceLoading.value || (!isPlaying.value && status.value !== 'error' && status.value !== 'unsupported'));
   const hasSound = computed(() => hasAudio.value && status.value === 'connected');
   const hasIntercom = computed(() => Boolean(typeof navigator !== 'undefined' && navigator.mediaDevices) && hasBackchannel.value);
   const muted = computed(() => currentStream.value?.muted.value ?? true);
@@ -798,6 +802,8 @@ export function useCameraStream(options: UseCameraStreamOptions): CameraStream {
     isPlaying,
     activeMode,
     activeResolution,
+    degradedFrom,
+    unsupported,
     hasAudio,
     hasBackchannel,
     error,

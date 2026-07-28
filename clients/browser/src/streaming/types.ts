@@ -4,7 +4,9 @@ import type { ReactiveCameraDevice } from '../types.js';
 
 export type VideoStreamingMode = 'webrtc' | 'webrtc/tcp' | 'mse' | 'auto';
 
-export type StreamStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error' | 'closed';
+export type StreamStatus = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'error' | 'unsupported' | 'closed';
+
+export type StreamDegradeReason = 'codec';
 
 export interface StreamState {
   status: StreamStatus;
@@ -26,6 +28,8 @@ export interface ReactiveStream {
   readonly requestedMode: Ref<VideoStreamingMode>;
   readonly activeResolution: Ref<StreamingRole>;
   readonly requestedResolution: Ref<StreamingRole>;
+  readonly degradedFrom: Ref<StreamingRole | null>;
+  readonly degradeReason: Ref<StreamDegradeReason | null>;
   readonly source: Ref<CameraSource | undefined>;
   readonly hasVideo: Ref<boolean>;
   readonly hasAudio: Ref<boolean>;

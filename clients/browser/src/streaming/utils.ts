@@ -3,6 +3,8 @@ import { STREAM_CONFIG } from './config.js';
 import type { AudioCodec, ProbeStream } from '@camera.ui/sdk';
 import type { CodecCompatibility } from './types.js';
 
+const H265_TEST_CODEC = 'hvc1.1.6.L153.B0';
+
 export function isSafari(): boolean {
   return /^((?!chrome|android).)*safari/i.test(navigator.userAgent);
 }
@@ -64,15 +66,59 @@ export function isWebRTCCompatibleVideo(codec: string): boolean {
   return false;
 }
 
-export function isH265Supported(): boolean {
-  try {
-    const videoCodecs = RTCRtpSender?.getCapabilities('video')?.codecs;
-    if (!videoCodecs) return false;
+let mseH265: boolean | undefined;
+let webrtcH265: boolean | undefined;
+let webcodecsH265: boolean | undefined;
 
-    return videoCodecs.some((c) => c.mimeType.toLowerCase().includes('h265') || c.mimeType.toLowerCase().includes('hevc'));
-  } catch {
-    return false;
+export function canPlayH265(transport: 'mse' | 'webrtc' | 'auto'): boolean {
+  if (transport === 'auto') {
+    return canPlayH265('webrtc') || canPlayH265('mse');
   }
+
+  if (transport === 'mse') {
+    if (mseH265 === undefined) {
+      const MediaSourceCtor = getMediaSourceConstructor();
+      mseH265 = !!MediaSourceCtor?.isTypeSupported(`video/mp4; codecs="${H265_TEST_CODEC}"`);
+    }
+    return mseH265;
+  }
+
+  if (webrtcH265 === undefined) {
+    try {
+      // receiver capabilities: playback is the receive side
+      const videoCodecs = RTCRtpReceiver?.getCapabilities('video')?.codecs;
+      webrtcH265 = !!videoCodecs?.some((c) => c.mimeType.toLowerCase().includes('h265') || c.mimeType.toLowerCase().includes('hevc'));
+    } catch {
+      webrtcH265 = false;
+    }
+  }
+  return webrtcH265;
+}
+
+export function reportH265DecodeFailure(transport: 'mse' | 'webrtc'): void {
+  if (transport === 'mse') {
+    mseH265 = false;
+  } else {
+    webrtcH265 = false;
+  }
+}
+
+export async function canDecodeH265(): Promise<boolean> {
+  if (webcodecsH265 !== undefined) return webcodecsH265;
+  try {
+    if (typeof VideoDecoder === 'undefined' || typeof VideoDecoder.isConfigSupported !== 'function') {
+      webcodecsH265 = false;
+    } else {
+      webcodecsH265 = (await VideoDecoder.isConfigSupported({ codec: H265_TEST_CODEC })).supported === true;
+    }
+  } catch {
+    webcodecsH265 = false;
+  }
+  return webcodecsH265;
+}
+
+export function isH265Supported(): boolean {
+  return canPlayH265('webrtc');
 }
 
 export function checkWebRTCCompatibility(probe: ProbeStream): CodecCompatibility {
