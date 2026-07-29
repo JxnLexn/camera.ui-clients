@@ -14,9 +14,11 @@ import type {
   CameraNamespaces,
   RefreshedStates,
   SensorAddedEvent,
-  SensorControllerNamespaces,
+  SensorAssignmentChangedEvent,
   SensorRefreshedState,
-  SensorRemovedEvent,
+  SensorRegistryNamespaces,
+  SensorConnectedChangedEvent,
+  SensorDeletedEvent,
 } from '../server/index.js';
 import type { ReactiveCameraDevice } from '../types.js';
 
@@ -25,13 +27,13 @@ export interface ReactiveCameraDeviceContext {
 }
 
 interface GlobalSensorEventMessage {
-  type: 'sensor:added' | 'sensor:removed';
-  data: SensorAddedEvent | SensorRemovedEvent;
+  type: 'sensor:added' | 'sensor:deleted' | 'sensor:connected:changed' | 'sensor:assignment:changed';
+  data: SensorAddedEvent | SensorDeletedEvent | SensorConnectedChangedEvent | SensorAssignmentChangedEvent;
 }
 
 export async function createReactiveCameraDevice(rpcOrContext: RPCClient | ReactiveCameraDeviceContext, initialCamera: Camera): Promise<ReactiveCameraDevice> {
   const cameraNamespaces: CameraNamespaces = NamespaceManager.cameraNamespaces(initialCamera._id);
-  const sensorNamespaces: SensorControllerNamespaces = NamespaceManager.sensorControllerNamespaces(initialCamera._id);
+  const sensorNamespaces: SensorRegistryNamespaces = NamespaceManager.sensorRegistryNamespaces();
 
   const ctx: ReactiveCameraDeviceContext | undefined =
     'rpc' in rpcOrContext && 'value' in (rpcOrContext as ReactiveCameraDeviceContext).rpc ? (rpcOrContext as ReactiveCameraDeviceContext) : undefined;
@@ -158,15 +160,38 @@ export async function createReactiveCameraDevice(rpcOrContext: RPCClient | React
   function handleSensorEvent(event: GlobalSensorEventMessage): void {
     if (event.type === 'sensor:added') {
       const addedEvent = event.data as SensorAddedEvent;
+      if (!addedEvent.sensor.assignedCameraIds.includes(initialCamera._id)) return;
+      if (!addedEvent.sensor.connected) return;
       sensorStates.value = {
         ...sensorStates.value,
         [addedEvent.sensor.id]: addedEvent.state,
       };
-    } else if (event.type === 'sensor:removed') {
-      const removedEvent = event.data as SensorRemovedEvent;
+    } else if (event.type === 'sensor:deleted') {
+      const deletedEvent = event.data as SensorDeletedEvent;
       const newStates = { ...sensorStates.value };
-      delete newStates[removedEvent.sensorId];
+      delete newStates[deletedEvent.sensorId];
       sensorStates.value = newStates;
+    } else if (event.type === 'sensor:connected:changed') {
+      const connectedEvent = event.data as SensorConnectedChangedEvent;
+      if (connectedEvent.connected) {
+        // connect events carry no state, refetch the camera's sensor set
+        refreshStates().catch(() => {});
+      } else {
+        const newStates = { ...sensorStates.value };
+        delete newStates[connectedEvent.sensorId];
+        sensorStates.value = newStates;
+      }
+    } else if (event.type === 'sensor:assignment:changed') {
+      const assignmentEvent = event.data as SensorAssignmentChangedEvent;
+      if (assignmentEvent.cameraId !== initialCamera._id) return;
+      if (assignmentEvent.assigned) {
+        // assignment events carry no state, refetch the camera's sensor set
+        refreshStates().catch(() => {});
+      } else {
+        const newStates = { ...sensorStates.value };
+        delete newStates[assignmentEvent.sensorId];
+        sensorStates.value = newStates;
+      }
     }
   }
 
@@ -175,7 +200,7 @@ export async function createReactiveCameraDevice(rpcOrContext: RPCClient | React
     closeSensorSubscription?.();
 
     closeSubscription = await rpcCall(rpcRef, (client) => client.subscribe<CameraDeviceListenerMessagePayload>(cameraNamespaces.cameraSubject, handleCameraEvent));
-    closeSensorSubscription = await rpcCall(rpcRef, (client) => client.subscribe<GlobalSensorEventMessage>(sensorNamespaces.sensorSubject, handleSensorEvent));
+    closeSensorSubscription = await rpcCall(rpcRef, (client) => client.subscribe<GlobalSensorEventMessage>(sensorNamespaces.sensorsSubject, handleSensorEvent));
 
     await refreshStates();
   }

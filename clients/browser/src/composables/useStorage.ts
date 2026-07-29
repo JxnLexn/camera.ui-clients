@@ -139,8 +139,8 @@ function getCameraStorageKey(pluginId: string, cameraId: string): string {
   return `plugin:${pluginId}:camera:${cameraId}`;
 }
 
-function getSensorStorageKey(pluginId: string, cameraId: string, sensorId: string): string {
-  return `plugin:${pluginId}:camera:${cameraId}:sensor:${sensorId}`;
+function getSensorStorageKey(pluginId: string, sensorId: string): string {
+  return `plugin:${pluginId}:sensor:${sensorId}`;
 }
 
 function acquireStorage(key: string, createProxy: () => Promisify<StorageRPC>): ReactiveStorage {
@@ -431,11 +431,7 @@ export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefO
   };
 }
 
-export function useSensorStorage(
-  camera: CameraIdentifier,
-  sensorId: MaybeRefOrGetter<string | undefined>,
-  pluginId: MaybeRefOrGetter<string | undefined>,
-): UseStorageReturn {
+export function useSensorStorage(sensorId: MaybeRefOrGetter<string | undefined>, pluginId: MaybeRefOrGetter<string | undefined>): UseStorageReturn {
   const { rpc, isConnected: clientConnected } = useCameraUi();
 
   const config = shallowRef<SchemaConfig | undefined>();
@@ -447,11 +443,11 @@ export function useSensorStorage(
 
   const operations = createStorageOperations(state, config, _isLoading, error);
 
-  function connect(cameraId: string, senId: string, plugId: string): boolean {
+  function connect(senId: string, plugId: string): boolean {
     if (!rpc.value || !clientConnected.value) return false;
 
     try {
-      const storageKey = getSensorStorageKey(plugId, cameraId, senId);
+      const storageKey = getSensorStorageKey(plugId, senId);
 
       if (state.currentStorageKey && state.currentStorageKey !== storageKey) {
         releaseStorage(state.currentStorageKey);
@@ -459,7 +455,7 @@ export function useSensorStorage(
 
       state.currentStorageKey = storageKey;
       state.cachedStorage = acquireStorage(storageKey, () => {
-        const namespaces = NamespaceManager.pluginSensorNamespaces(plugId, cameraId, senId);
+        const namespaces = NamespaceManager.pluginSensorNamespaces(plugId, senId);
         return rpc.value!.createProxy<StorageRPC>(namespaces.sensorStorageRpc);
       });
 
@@ -473,14 +469,13 @@ export function useSensorStorage(
   }
 
   async function getConfig(): Promise<SchemaConfig | undefined> {
-    const cameraId = extractCameraId(toValue(camera));
     const senId = toValue(sensorId);
     const plugId = toValue(pluginId);
 
-    if (!cameraId || !senId || !plugId) return undefined;
+    if (!senId || !plugId) return undefined;
 
     if (!state.cachedStorage) {
-      const connected = connect(cameraId, senId, plugId);
+      const connected = connect(senId, plugId);
       if (!connected) return undefined;
     }
 
@@ -488,10 +483,10 @@ export function useSensorStorage(
   }
 
   watch(
-    [clientConnected, () => extractCameraId(toValue(camera)), () => toValue(sensorId), () => toValue(pluginId)],
-    ([connected, cameraId, senId, plugId]) => {
-      if (connected && cameraId && senId && plugId) {
-        connect(cameraId, senId, plugId);
+    [clientConnected, () => toValue(sensorId), () => toValue(pluginId)],
+    ([connected, senId, plugId]) => {
+      if (connected && senId && plugId) {
+        connect(senId, plugId);
         // Auto-fetch config when storage connects with new params
         operations.getConfig();
       } else {

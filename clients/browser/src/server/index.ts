@@ -11,9 +11,10 @@ export {
   type PluginCameraNamespaces,
   type PluginNamespaces,
   type PluginSensorNamespaces,
-  type SensorControllerNamespaces,
+  type SensorCameraViewNamespaces,
   type SensorEventNamespaces,
   type SensorProviderNamespaces,
+  type SensorRegistryNamespaces,
   type TerminalManagerNamespaces,
 } from '../../../../externals/camera.ui/server/src/rpc/namespaces.js';
 
@@ -27,9 +28,13 @@ export type {
 } from '../../../../externals/camera.ui/server/src/rpc/interfaces/device.js';
 export type {
   SensorAddedEvent,
+  SensorAssignmentChangedEvent,
   SensorCapabilitiesChangedEvent,
+  SensorConnectedChangedEvent,
+  SensorDeletedEvent,
+  SensorDisplayNameChangedEvent,
+  SensorExposedChangedEvent,
   SensorRefreshedState,
-  SensorRemovedEvent,
   StoredSensorData,
 } from '../../../../externals/camera.ui/server/src/rpc/interfaces/sensor.js';
 export type { TerminalManagerInterface, TerminalOptions, TerminalSessionInfo } from '../../../../externals/camera.ui/server/src/rpc/interfaces/terminal.js';

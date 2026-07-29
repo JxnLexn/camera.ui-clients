@@ -43,6 +43,7 @@ export {
   usePTZControl,
   useSensorById,
   useSensorByType,
+  useAllSensors,
   useSensors,
   useSensorsByType,
 } from './useSensor.js';
@@ -81,7 +82,7 @@ export type {
   ReactiveSmokeSensor,
   ReactiveLeakSensor,
   ReactiveGarageControl,
-  SensorControllerRPC,
+  SensorRegistryRPC,
   SensorEventMessage,
   SensorRefreshedState,
   StoredSensorData,

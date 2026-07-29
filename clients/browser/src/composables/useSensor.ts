@@ -29,11 +29,7 @@ import {
 import { tryOnScopeDispose } from '@vueuse/core';
 import { computed, reactive, ref, shallowRef, toValue, watch } from 'vue';
 
-import { NamespaceManager } from '../server/index.js';
-import { createDebouncedCache } from '../utils/createDebouncedCache.js';
-import { useCameraUi } from './useCameraUi.js';
-import { rpcCall } from './useRpc.js';
-import { extractCameraId } from './utils.js';
+import type { RPCClient } from '@camera.ui/rpc';
 import type {
   AudioSensorProperties,
   BatteryInfoProperties,
@@ -64,19 +60,31 @@ import type {
 } from '@camera.ui/sdk';
 import type { PropertyChangedEvent } from '@camera.ui/sdk/internal';
 import type { ComputedRef, MaybeRefOrGetter, Ref, ShallowRef } from 'vue';
-import type { RPCClient } from '@camera.ui/rpc';
-import type { SensorAddedEvent, SensorCapabilitiesChangedEvent, SensorRefreshedState, SensorRemovedEvent, StoredSensorData } from '../server/index.js';
+import type {
+  SensorAddedEvent,
+  SensorAssignmentChangedEvent,
+  SensorCapabilitiesChangedEvent,
+  SensorConnectedChangedEvent,
+  SensorDeletedEvent,
+  SensorDisplayNameChangedEvent,
+  SensorExposedChangedEvent,
+  SensorRefreshedState,
+  StoredSensorData,
+} from '../server/index.js';
+import { NamespaceManager } from '../server/index.js';
+import { createDebouncedCache } from '../utils/createDebouncedCache.js';
 import type { ReactiveCameraDeviceContext } from './useCamera.js';
+import { useCameraUi } from './useCameraUi.js';
+import { rpcCall } from './useRpc.js';
 import type { CameraIdentifier } from './utils.js';
+import { extractCameraId } from './utils.js';
 
 export type { SensorRefreshedState, StoredSensorData } from '../server/index.js';
 export type { CameraIdentifier } from './utils.js';
 
-export interface SensorControllerRPC {
+export interface SensorRegistryRPC {
   getSensors(): StoredSensorData[];
-  getSensor(sensorId: string): StoredSensorData | undefined;
-  getSensorByType(sensorType: SensorType): StoredSensorData | undefined;
-  getSensorsByType(sensorType: SensorType): StoredSensorData[];
+  getSensorRpc(sensorId: string): StoredSensorData | undefined;
   getSensorState(sensorId: string): SensorRefreshedState;
   getSensorStates(): Record<string, SensorRefreshedState>;
   getPropertyValue(sensorId: string, property: string): unknown;
@@ -84,15 +92,25 @@ export interface SensorControllerRPC {
   setDisplayName(sensorId: string, displayName: string): void;
 }
 
-export interface SensorDisplayNameChangedEvent {
-  cameraId: string;
-  sensorId: string;
-  displayName: string;
-}
-
 export interface SensorEventMessage {
-  type: 'property:changed' | 'sensor:added' | 'sensor:removed' | 'sensor:displayName:changed' | 'sensor:capabilities:changed';
-  data: PropertyChangedEvent | SensorAddedEvent | SensorRemovedEvent | SensorDisplayNameChangedEvent | SensorCapabilitiesChangedEvent;
+  type:
+    | 'property:changed'
+    | 'sensor:added'
+    | 'sensor:deleted'
+    | 'sensor:connected:changed'
+    | 'sensor:displayName:changed'
+    | 'sensor:capabilities:changed'
+    | 'sensor:assignment:changed'
+    | 'sensor:exposed:changed';
+  data:
+    | PropertyChangedEvent
+    | SensorAddedEvent
+    | SensorDeletedEvent
+    | SensorConnectedChangedEvent
+    | SensorDisplayNameChangedEvent
+    | SensorCapabilitiesChangedEvent
+    | SensorAssignmentChangedEvent
+    | SensorExposedChangedEvent;
 }
 
 export interface ReactiveSensor<TProperties extends object = Record<string, unknown>> {
@@ -100,7 +118,11 @@ export interface ReactiveSensor<TProperties extends object = Record<string, unkn
   readonly type: SensorType;
   readonly name: string;
   readonly displayName: Ref<string>;
+  readonly nativeId?: string;
   readonly pluginId: string;
+  readonly assignedCameraIds: Ref<string[]>;
+  readonly exposed: Ref<boolean>;
+  readonly connected: Ref<boolean>;
   readonly capabilities: Ref<string[]>;
   readonly properties: TProperties;
   getProperty<T = unknown>(property: string): T | undefined;
@@ -320,9 +342,12 @@ interface InternalReactiveSensor extends ReactiveSensor {
   _notifyCapabilitiesChanged(): void;
 }
 
-function createReactiveSensor(data: StoredSensorData, state: SensorRefreshedState, rpcRef: ShallowRef<RPCClient | undefined>, cameraId: string): InternalReactiveSensor {
+function createReactiveSensor(data: StoredSensorData, state: SensorRefreshedState, rpcRef: ShallowRef<RPCClient | undefined>): InternalReactiveSensor {
   const displayName = ref(state.displayName ?? data.displayName ?? data.name);
   const capabilities = ref<string[]>(state.capabilities ?? data.capabilities ?? []);
+  const assignedCameraIds = ref<string[]>([...data.assignedCameraIds]);
+  const exposed = ref(data.exposed);
+  const connected = ref(data.connected);
   const properties = reactive<Record<string, unknown>>({ ...state.properties });
   const capabilityCallbacks: ((capabilities: string[]) => void)[] = [];
 
@@ -331,7 +356,11 @@ function createReactiveSensor(data: StoredSensorData, state: SensorRefreshedStat
     type: data.type,
     name: data.name,
     displayName,
+    nativeId: data.nativeId,
     pluginId: data.pluginId,
+    assignedCameraIds,
+    exposed,
+    connected,
     capabilities,
     properties,
 
@@ -343,15 +372,15 @@ function createReactiveSensor(data: StoredSensorData, state: SensorRefreshedStat
       // SDK Sensor base class exposes `updateValue(property, value)` as the external write
       // entry-point. Concrete control sensor classes (Light, Siren, Lock, etc.) override
       // `updateValue` to dispatch to their semantic setters (`setOn`, `setActive`, ...).
-      const sensorNamespace = `plugin.${data.pluginId}.camera.${cameraId}.sensor.${data.id}.rpc`;
+      const sensorNamespace = `plugin.${data.pluginId}.sensor.${data.id}.rpc`;
       await rpcCall(rpcRef, (client) =>
         client.createProxy<{ updateValue(property: string, value: unknown): Promise<void> }>(sensorNamespace).updateValue(property, value),
       );
     },
 
     async setDisplayName(newDisplayName: string): Promise<void> {
-      const namespace = NamespaceManager.sensorControllerNamespaces(cameraId);
-      await rpcCall(rpcRef, (client) => client.createProxy<SensorControllerRPC>(namespace.sensorRpc).setDisplayName(data.id, newDisplayName));
+      const namespace = NamespaceManager.sensorRegistryNamespaces();
+      await rpcCall(rpcRef, (client) => client.createProxy<SensorRegistryRPC>(namespace.sensorsRpc).setDisplayName(data.id, newDisplayName));
     },
 
     hasCapability(capability: string): boolean {
@@ -376,12 +405,8 @@ function createReactiveSensor(data: StoredSensorData, state: SensorRefreshedStat
   };
 }
 
-export function createSensorManager(
-  rpcOrContext: RPCClient | ReactiveCameraDeviceContext,
-  cameraId: string,
-  sensorSubjectNamespace: string,
-  sensorRpcNamespace: string,
-): ReactiveSensorManager {
+export function createSensorManager(rpcOrContext: RPCClient | ReactiveCameraDeviceContext): ReactiveSensorManager {
+  const { sensorsSubject, sensorsRpc } = NamespaceManager.sensorRegistryNamespaces();
   const ctx: ReactiveCameraDeviceContext | undefined =
     'rpc' in rpcOrContext && 'value' in (rpcOrContext as ReactiveCameraDeviceContext).rpc ? (rpcOrContext as ReactiveCameraDeviceContext) : undefined;
   // When called with a bare RPCClient (NVR consumer path), wrap it in a
@@ -415,7 +440,7 @@ export function createSensorManager(
   async function subscribeToSensorEvents(sensorId: string): Promise<void> {
     if (sensorSubscriptions.has(sensorId)) return;
 
-    const namespace = NamespaceManager.sensorEventNamespaces(cameraId, sensorId);
+    const namespace = NamespaceManager.sensorEventNamespaces(sensorId);
     const unsubscribe = await rpcCall(rpcRef, (c) =>
       c.subscribe<SensorEventMessage>(namespace.sensorSubject, (msg: SensorEventMessage) => handlePerSensorEvent(sensorId, msg)),
     );
@@ -435,17 +460,33 @@ export function createSensorManager(
       const event = message.data as SensorAddedEvent;
       // Skip if sensor already exists (race with doInit during reconnect)
       if (sensorMap.value.has(event.sensor.id)) return;
-      const reactiveSensor = createReactiveSensor(event.sensor, event.state, rpcRef, cameraId);
+      const reactiveSensor = createReactiveSensor(event.sensor, event.state, rpcRef);
       const newMap = new Map(sensorMap.value);
       newMap.set(event.sensor.id, reactiveSensor);
       sensorMap.value = newMap;
       subscribeToSensorEvents(event.sensor.id);
-    } else if (message.type === 'sensor:removed') {
-      const event = message.data as SensorRemovedEvent;
+    } else if (message.type === 'sensor:deleted') {
+      const event = message.data as SensorDeletedEvent;
       unsubscribeFromSensorEvents(event.sensorId);
       const newMap = new Map(sensorMap.value);
       newMap.delete(event.sensorId);
       sensorMap.value = newMap;
+    } else if (message.type === 'sensor:connected:changed') {
+      const event = message.data as SensorConnectedChangedEvent;
+      const sensor = sensorMap.value.get(event.sensorId);
+      if (sensor) sensor.connected.value = event.connected;
+    } else if (message.type === 'sensor:assignment:changed') {
+      const event = message.data as SensorAssignmentChangedEvent;
+      const sensor = sensorMap.value.get(event.sensorId);
+      if (!sensor) return;
+      const cameras = new Set(sensor.assignedCameraIds.value);
+      if (event.assigned) cameras.add(event.cameraId);
+      else cameras.delete(event.cameraId);
+      sensor.assignedCameraIds.value = [...cameras];
+    } else if (message.type === 'sensor:exposed:changed') {
+      const event = message.data as SensorExposedChangedEvent;
+      const sensor = sensorMap.value.get(event.sensorId);
+      if (sensor) sensor.exposed.value = event.exposed;
     }
   }
 
@@ -461,7 +502,7 @@ export function createSensorManager(
     // Subscribe to global events first, but queue them until the initial load is done
     let pendingEvents: SensorEventMessage[] | undefined = [];
     globalUnsubscribe = await rpcCall(rpcRef, (c) =>
-      c.subscribe<SensorEventMessage>(sensorSubjectNamespace, (msg: SensorEventMessage) => {
+      c.subscribe<SensorEventMessage>(sensorsSubject, (msg: SensorEventMessage) => {
         if (pendingEvents) {
           pendingEvents.push(msg);
         } else {
@@ -471,14 +512,14 @@ export function createSensorManager(
     );
 
     const [sensors, states] = await rpcCall(rpcRef, async (c) => {
-      const proxy = c.createProxy<SensorControllerRPC>(sensorRpcNamespace);
+      const proxy = c.createProxy<SensorRegistryRPC>(sensorsRpc);
       return Promise.all([proxy.getSensors(), proxy.getSensorStates()]);
     });
 
     const newMap = new Map<string, InternalReactiveSensor>();
     for (const sensor of sensors) {
       const state = states[sensor.id] ?? { properties: {}, capabilities: [], type: sensor.type };
-      const reactiveSensor = createReactiveSensor(sensor, state, rpcRef, cameraId);
+      const reactiveSensor = createReactiveSensor(sensor, state, rpcRef);
       newMap.set(sensor.id, reactiveSensor);
     }
     sensorMap.value = newMap;
@@ -568,7 +609,7 @@ export function createSensorManager(
     },
 
     async setDisplayName(sensorId: string, displayName: string): Promise<void> {
-      await rpcCall(rpcRef, (c) => c.createProxy<SensorControllerRPC>(sensorRpcNamespace).setDisplayName(sensorId, displayName));
+      await rpcCall(rpcRef, (c) => c.createProxy<SensorRegistryRPC>(sensorsRpc).setDisplayName(sensorId, displayName));
     },
 
     ensureInitialized,
@@ -597,16 +638,14 @@ export function reconnectAllSensorManagers(): void {
   });
 }
 
-export function acquireSensorManager(cameraId: string, rpcOrContext: RPCClient | ReactiveCameraDeviceContext): CachedSensorManager {
-  return sensorManagerCache.acquire(cameraId, () => {
-    const namespaces = NamespaceManager.sensorControllerNamespaces(cameraId);
-    const manager = createSensorManager(rpcOrContext, cameraId, namespaces.sensorSubject, namespaces.sensorRpc);
-    return { manager };
-  });
+const GLOBAL_SENSOR_MANAGER_KEY = 'sensors';
+
+export function acquireSensorManager(rpcOrContext: RPCClient | ReactiveCameraDeviceContext): CachedSensorManager {
+  return sensorManagerCache.acquire(GLOBAL_SENSOR_MANAGER_KEY, () => ({ manager: createSensorManager(rpcOrContext) }));
 }
 
-export function releaseSensorManager(cameraId: string): void {
-  sensorManagerCache.release(cameraId);
+export function releaseSensorManager(): void {
+  sensorManagerCache.release(GLOBAL_SENSOR_MANAGER_KEY);
 }
 
 export interface UseSensorReturn {
@@ -634,32 +673,29 @@ export interface UseSensorsTypedReturn<T extends ReactiveSensor<any> = ReactiveS
 }
 
 interface SensorComposableState {
-  currentCameraId: string | undefined;
+  acquired: boolean;
   cachedManager: ReactiveSensorManager | undefined;
 }
 
 function createSensorComposableState(): SensorComposableState {
   return {
-    currentCameraId: undefined,
+    acquired: false,
     cachedManager: undefined,
   };
+}
+
+function sensorsForCamera(manager: ReactiveSensorManager, cameraId: string): ReactiveSensor[] {
+  return manager.sensors.value.filter((sensor) => sensor.assignedCameraIds.value.includes(cameraId));
 }
 
 async function ensureSensorManager(
   state: SensorComposableState,
   cameraUi: ReactiveCameraDeviceContext,
   isConnected: boolean,
-  cameraId: string,
   isLoading: Ref<boolean>,
   error: Ref<Error | undefined>,
 ): Promise<ReactiveSensorManager | undefined> {
   if (!cameraUi.rpc.value || !isConnected) return undefined;
-
-  if (state.currentCameraId && state.currentCameraId !== cameraId) {
-    releaseSensorManager(state.currentCameraId);
-    state.currentCameraId = undefined;
-    state.cachedManager = undefined;
-  }
 
   isLoading.value = true;
   error.value = undefined;
@@ -667,8 +703,8 @@ async function ensureSensorManager(
   try {
     // Pass the cameraUiContext so the cached manager dynamically resolves
     // the current client — survives a race-winner adoption / endpoint swap.
-    const cached = acquireSensorManager(cameraId, cameraUi);
-    state.currentCameraId = cameraId;
+    const cached = acquireSensorManager(cameraUi);
+    state.acquired = true;
     state.cachedManager = cached.manager;
 
     if (!cached.initPromise) {
@@ -686,9 +722,9 @@ async function ensureSensorManager(
 }
 
 function cleanupSensorComposable(state: SensorComposableState): void {
-  if (state.currentCameraId) {
-    releaseSensorManager(state.currentCameraId);
-    state.currentCameraId = undefined;
+  if (state.acquired) {
+    releaseSensorManager();
+    state.acquired = false;
     state.cachedManager = undefined;
   }
 }
@@ -706,7 +742,7 @@ export function useSensorById(camera: CameraIdentifier, sensorId: MaybeRefOrGett
     [isConnected, () => extractCameraId(toValue(camera)), () => toValue(sensorId)],
     async ([connected, camId, senId]) => {
       if (connected && camId && senId) {
-        const manager = await ensureSensorManager(state, cameraUi, connected, camId, _isLoading, error);
+        const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
         sensor.value = manager?.getSensor(senId);
         initialLoadDone.value = true;
       } else {
@@ -738,8 +774,8 @@ export function useSensorByType(camera: CameraIdentifier, sensorType: MaybeRefOr
     [isConnected, () => extractCameraId(toValue(camera)), () => toValue(sensorType)],
     async ([connected, camId, type]) => {
       if (connected && camId) {
-        const manager = await ensureSensorManager(state, cameraUi, connected, camId, _isLoading, error);
-        sensor.value = manager?.getSensorsByType(type)[0];
+        const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
+        sensor.value = manager ? sensorsForCamera(manager, camId).find((s) => s.type === type) : undefined;
         initialLoadDone.value = true;
       } else {
         // Camera id flipped to undefined (caller gated the composable).
@@ -775,9 +811,9 @@ export function useSensorsByType(camera: CameraIdentifier, sensorType: MaybeRefO
     [isConnected, () => extractCameraId(toValue(camera)), () => toValue(sensorType)],
     async ([connected, camId, type]) => {
       if (connected && camId) {
-        const manager = await ensureSensorManager(state, cameraUi, connected, camId, _isLoading, error);
+        const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
         cachedManager.value = manager;
-        sensorsRef.value = manager?.getSensorsByType(type) ?? [];
+        sensorsRef.value = manager ? sensorsForCamera(manager, camId).filter((s) => s.type === type) : [];
         initialLoadDone.value = true;
       } else {
         cleanupSensorComposable(state);
@@ -790,8 +826,10 @@ export function useSensorsByType(camera: CameraIdentifier, sensorType: MaybeRefO
 
   const sensors = computed(() => {
     if (!cachedManager.value) return [];
+    const camId = extractCameraId(toValue(camera));
     const type = toValue(sensorType);
-    return cachedManager.value.sensors.value.filter((s) => s.type === type);
+    if (!camId) return [];
+    return sensorsForCamera(cachedManager.value, camId).filter((s) => s.type === type);
   });
 
   tryOnScopeDispose(() => {
@@ -816,9 +854,9 @@ export function useSensors(camera: CameraIdentifier): UseSensorsReturn {
     [isConnected, () => extractCameraId(toValue(camera))],
     async ([connected, camId]) => {
       if (connected && camId) {
-        const manager = await ensureSensorManager(state, cameraUi, connected, camId, _isLoading, error);
+        const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
         cachedManager.value = manager;
-        sensorsRef.value = manager?.sensors.value ?? [];
+        sensorsRef.value = manager ? sensorsForCamera(manager, camId) : [];
         initialLoadDone.value = true;
       } else {
         cleanupSensorComposable(state);
@@ -829,11 +867,48 @@ export function useSensors(camera: CameraIdentifier): UseSensorsReturn {
     { immediate: true },
   );
 
-  const sensors = computed(() => cachedManager.value?.sensors.value ?? []);
+  const sensors = computed(() => {
+    if (!cachedManager.value) return [];
+    const camId = extractCameraId(toValue(camera));
+    if (!camId) return [];
+    return sensorsForCamera(cachedManager.value, camId);
+  });
 
   tryOnScopeDispose(() => {
     cleanupSensorComposable(state);
     sensorsRef.value = [];
+  });
+
+  return { sensors, isLoading: computed(() => _isLoading.value || !initialLoadDone.value), error };
+}
+
+export function useAllSensors(): UseSensorsReturn {
+  const cameraUi = useCameraUi();
+  const { isConnected } = cameraUi;
+  const cachedManager = shallowRef<ReactiveSensorManager | undefined>();
+  const _isLoading = ref(false);
+  const initialLoadDone = ref(false);
+  const error = ref<Error | undefined>();
+  const state = createSensorComposableState();
+
+  watch(
+    [isConnected],
+    async ([connected]) => {
+      if (connected) {
+        cachedManager.value = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
+        initialLoadDone.value = true;
+      } else {
+        cleanupSensorComposable(state);
+        cachedManager.value = undefined;
+      }
+    },
+    { immediate: true },
+  );
+
+  const sensors = computed(() => cachedManager.value?.sensors.value ?? []);
+
+  tryOnScopeDispose(() => {
+    cleanupSensorComposable(state);
   });
 
   return { sensors, isLoading: computed(() => _isLoading.value || !initialLoadDone.value), error };
@@ -853,9 +928,9 @@ function useTypedSensor<T extends ReactiveSensor<any>>(camera: CameraIdentifier,
     [isConnected, () => extractCameraId(toValue(camera))],
     async ([connected, camId]) => {
       if (connected && camId) {
-        const manager = await ensureSensorManager(state, cameraUi, connected, camId, _isLoading, error);
+        const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
         cachedManager.value = manager;
-        sensor.value = manager?.getSensorsByType(sensorType)[0] as T | undefined;
+        sensor.value = manager ? (sensorsForCamera(manager, camId).find((s) => s.type === sensorType) as T | undefined) : undefined;
         initialLoadDone.value = true;
       } else {
         // Camera id flipped to undefined (caller gated the composable).
@@ -872,13 +947,14 @@ function useTypedSensor<T extends ReactiveSensor<any>>(camera: CameraIdentifier,
   watch(
     () => {
       if (!cachedManager.value) return undefined;
-      const sensors = cachedManager.value.getSensorsByType(sensorType);
-      return sensors[0]?.id;
+      const camId = extractCameraId(toValue(camera));
+      if (!camId) return undefined;
+      return sensorsForCamera(cachedManager.value, camId).find((s) => s.type === sensorType)?.id;
     },
     () => {
       if (cachedManager.value) {
-        const sensors = cachedManager.value.getSensorsByType(sensorType);
-        sensor.value = sensors[0] as T | undefined;
+        const camId = extractCameraId(toValue(camera));
+        sensor.value = camId ? (sensorsForCamera(cachedManager.value, camId).find((s) => s.type === sensorType) as T | undefined) : undefined;
       }
     },
   );
@@ -929,9 +1005,9 @@ export function useClassifierSensors(camera: CameraIdentifier): UseSensorsTypedR
     [isConnected, () => extractCameraId(toValue(camera))],
     async ([connected, camId]) => {
       if (connected && camId) {
-        const manager = await ensureSensorManager(state, cameraUi, connected, camId, _isLoading, error);
+        const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
         cachedManager.value = manager;
-        sensorsRef.value = (manager?.getSensorsByType(SensorType.Classifier) ?? []) as unknown as ReactiveClassifierSensor[];
+        sensorsRef.value = (manager ? sensorsForCamera(manager, camId).filter((s) => s.type === SensorType.Classifier) : []) as unknown as ReactiveClassifierSensor[];
         initialLoadDone.value = true;
       } else {
         cleanupSensorComposable(state);
@@ -942,7 +1018,12 @@ export function useClassifierSensors(camera: CameraIdentifier): UseSensorsTypedR
     { immediate: true },
   );
 
-  const sensors = computed(() => (cachedManager.value?.getSensorsByType(SensorType.Classifier) ?? []) as unknown as ReactiveClassifierSensor[]);
+  const sensors = computed(() => {
+    if (!cachedManager.value) return [] as ReactiveClassifierSensor[];
+    const camId = extractCameraId(toValue(camera));
+    if (!camId) return [] as ReactiveClassifierSensor[];
+    return sensorsForCamera(cachedManager.value, camId).filter((s) => s.type === SensorType.Classifier) as unknown as ReactiveClassifierSensor[];
+  });
 
   tryOnScopeDispose(() => {
     cleanupSensorComposable(state);
