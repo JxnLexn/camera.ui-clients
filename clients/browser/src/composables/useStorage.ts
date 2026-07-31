@@ -181,18 +181,41 @@ function cleanupStorage(state: StorageComposableState, isConnected: Ref<boolean>
   config.value = undefined;
 }
 
+const GET_CONFIG_RETRY_DELAYS = [2_000, 5_000, 10_000, 15_000];
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function createStorageOperations(state: StorageComposableState, config: ShallowRef<SchemaConfig | undefined>, isLoading: Ref<boolean>, error: Ref<Error | undefined>) {
-  async function getConfig(): Promise<SchemaConfig | undefined> {
+  let inflightGetConfig: Promise<SchemaConfig | undefined> | undefined;
+
+  function getConfig(): Promise<SchemaConfig | undefined> {
+    inflightGetConfig ??= getConfigWithRetry().finally(() => (inflightGetConfig = undefined));
+    return inflightGetConfig;
+  }
+
+  async function getConfigWithRetry(): Promise<SchemaConfig | undefined> {
     const cached = state.cachedStorage;
     if (!cached) return undefined;
 
-    const result = await cached.getConfig();
-    if (state.cachedStorage !== cached) return result;
+    isLoading.value = true;
+    try {
+      let result = await cached.getConfig();
+      for (const delay of GET_CONFIG_RETRY_DELAYS) {
+        if (!cached.error.value || state.cachedStorage !== cached) break;
+        await sleep(delay);
+        if (state.cachedStorage !== cached) break;
+        result = await cached.getConfig();
+      }
+      if (state.cachedStorage !== cached) return result;
 
-    config.value = cached.config.value;
-    isLoading.value = cached.isLoading.value;
-    error.value = cached.error.value;
-    return result;
+      config.value = cached.config.value;
+      error.value = cached.error.value;
+      return result;
+    } finally {
+      isLoading.value = false;
+    }
   }
 
   async function setValue<T = unknown>(key: string, value: T): Promise<void> {
