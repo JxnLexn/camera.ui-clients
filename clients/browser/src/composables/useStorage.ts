@@ -189,9 +189,19 @@ function sleep(ms: number): Promise<void> {
 
 function createStorageOperations(state: StorageComposableState, config: ShallowRef<SchemaConfig | undefined>, isLoading: Ref<boolean>, error: Ref<Error | undefined>) {
   let inflightGetConfig: Promise<SchemaConfig | undefined> | undefined;
+  let inflightStorage: ReactiveStorage | undefined;
 
   function getConfig(): Promise<SchemaConfig | undefined> {
-    inflightGetConfig ??= getConfigWithRetry().finally(() => (inflightGetConfig = undefined));
+    if (!inflightGetConfig || inflightStorage !== state.cachedStorage) {
+      inflightStorage = state.cachedStorage;
+      const request = getConfigWithRetry().finally(() => {
+        if (inflightGetConfig === request) {
+          inflightGetConfig = undefined;
+          inflightStorage = undefined;
+        }
+      });
+      inflightGetConfig = request;
+    }
     return inflightGetConfig;
   }
 
