@@ -1,14 +1,20 @@
 import {
   AudioProperty,
   BatteryProperty,
+  CarbonDioxideProperty,
+  CarbonMonoxideProperty,
   ChargingState,
   ClassifierProperty,
+  ColdProperty,
   ContactProperty,
   DoorbellProperty,
   FaceProperty,
   GarageProperty,
   GarageState,
+  GasProperty,
+  HeatProperty,
   HumidityProperty,
+  IlluminanceProperty,
   LeakProperty,
   LicensePlateProperty,
   LightProperty,
@@ -17,6 +23,8 @@ import {
   MotionProperty,
   ObjectProperty,
   OccupancyProperty,
+  PowerProperty,
+  ProblemProperty,
   PTZProperty,
   SecuritySystemProperty,
   SecuritySystemState,
@@ -24,7 +32,9 @@ import {
   SirenProperty,
   SmokeProperty,
   SwitchProperty,
+  TamperProperty,
   TemperatureProperty,
+  VibrationProperty,
 } from '@camera.ui/sdk';
 import { tryOnScopeDispose } from '@vueuse/core';
 import { computed, reactive, ref, shallowRef, toValue, watch } from 'vue';
@@ -33,14 +43,20 @@ import type { RPCClient } from '@camera.ui/rpc';
 import type {
   AudioSensorProperties,
   BatteryInfoProperties,
+  CarbonDioxideInfoProperties,
+  CarbonMonoxideSensorProperties,
   ClassifierSensorProperties,
+  ColdSensorProperties,
   ContactSensorProperties,
   Detection,
   DoorbellTriggerProperties,
   FaceDetection,
   FaceSensorProperties,
   GarageControlProperties,
+  GasSensorProperties,
+  HeatSensorProperties,
   HumidityInfoProperties,
+  IlluminanceInfoProperties,
   LeakSensorProperties,
   LicensePlateDetection,
   LicensePlateSensorProperties,
@@ -49,6 +65,8 @@ import type {
   MotionSensorProperties,
   ObjectSensorProperties,
   OccupancySensorProperties,
+  PowerSensorProperties,
+  ProblemSensorProperties,
   PTZControlProperties,
   PTZDirection,
   PTZPosition,
@@ -56,7 +74,9 @@ import type {
   SirenControlProperties,
   SmokeSensorProperties,
   SwitchControlProperties,
+  TamperSensorProperties,
   TemperatureInfoProperties,
+  VibrationSensorProperties,
 } from '@camera.ui/sdk';
 import type { PropertyChangedEvent } from '@camera.ui/sdk/internal';
 import type { ComputedRef, MaybeRefOrGetter, Ref, ShallowRef } from 'vue';
@@ -271,6 +291,17 @@ export interface ReactiveHumidityInfo extends ReactiveSensor<HumidityInfoPropert
   getProperty(property: typeof HumidityProperty.Current): number | undefined;
   getProperty(property: string): unknown;
 }
+export interface ReactiveIlluminanceInfo extends ReactiveSensor<IlluminanceInfoProperties> {
+  readonly type: typeof SensorType.Illuminance;
+  getProperty(property: typeof IlluminanceProperty.Current): number | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveCarbonDioxideInfo extends ReactiveSensor<CarbonDioxideInfoProperties> {
+  readonly type: typeof SensorType.CarbonDioxide;
+  getProperty(property: typeof CarbonDioxideProperty.Current): number | undefined;
+  getProperty(property: string): unknown;
+}
 
 export interface ReactiveOccupancySensor extends ReactiveSensor<OccupancySensorProperties> {
   readonly type: typeof SensorType.Occupancy;
@@ -287,6 +318,53 @@ export interface ReactiveSmokeSensor extends ReactiveSensor<SmokeSensorPropertie
 export interface ReactiveLeakSensor extends ReactiveSensor<LeakSensorProperties> {
   readonly type: typeof SensorType.Leak;
   getProperty(property: typeof LeakProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+export interface ReactiveGasSensor extends ReactiveSensor<GasSensorProperties> {
+  readonly type: typeof SensorType.Gas;
+  getProperty(property: typeof GasProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveCarbonMonoxideSensor extends ReactiveSensor<CarbonMonoxideSensorProperties> {
+  readonly type: typeof SensorType.CarbonMonoxide;
+  getProperty(property: typeof CarbonMonoxideProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveHeatSensor extends ReactiveSensor<HeatSensorProperties> {
+  readonly type: typeof SensorType.Heat;
+  getProperty(property: typeof HeatProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveColdSensor extends ReactiveSensor<ColdSensorProperties> {
+  readonly type: typeof SensorType.Cold;
+  getProperty(property: typeof ColdProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveVibrationSensor extends ReactiveSensor<VibrationSensorProperties> {
+  readonly type: typeof SensorType.Vibration;
+  getProperty(property: typeof VibrationProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveTamperSensor extends ReactiveSensor<TamperSensorProperties> {
+  readonly type: typeof SensorType.Tamper;
+  getProperty(property: typeof TamperProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactiveProblemSensor extends ReactiveSensor<ProblemSensorProperties> {
+  readonly type: typeof SensorType.Problem;
+  getProperty(property: typeof ProblemProperty.Detected): boolean | undefined;
+  getProperty(property: string): unknown;
+}
+
+export interface ReactivePowerSensor extends ReactiveSensor<PowerSensorProperties> {
+  readonly type: typeof SensorType.Power;
+  getProperty(property: typeof PowerProperty.Detected): boolean | undefined;
   getProperty(property: string): unknown;
 }
 
@@ -324,6 +402,16 @@ export const isReactiveHumidityInfo = createSensorTypeGuard<ReactiveHumidityInfo
 export const isReactiveOccupancySensor = createSensorTypeGuard<ReactiveOccupancySensor>(SensorType.Occupancy);
 export const isReactiveSmokeSensor = createSensorTypeGuard<ReactiveSmokeSensor>(SensorType.Smoke);
 export const isReactiveLeakSensor = createSensorTypeGuard<ReactiveLeakSensor>(SensorType.Leak);
+export const isReactiveGasSensor = createSensorTypeGuard<ReactiveGasSensor>(SensorType.Gas);
+export const isReactiveCarbonMonoxideSensor = createSensorTypeGuard<ReactiveCarbonMonoxideSensor>(SensorType.CarbonMonoxide);
+export const isReactiveHeatSensor = createSensorTypeGuard<ReactiveHeatSensor>(SensorType.Heat);
+export const isReactiveColdSensor = createSensorTypeGuard<ReactiveColdSensor>(SensorType.Cold);
+export const isReactiveVibrationSensor = createSensorTypeGuard<ReactiveVibrationSensor>(SensorType.Vibration);
+export const isReactiveTamperSensor = createSensorTypeGuard<ReactiveTamperSensor>(SensorType.Tamper);
+export const isReactiveProblemSensor = createSensorTypeGuard<ReactiveProblemSensor>(SensorType.Problem);
+export const isReactivePowerSensor = createSensorTypeGuard<ReactivePowerSensor>(SensorType.Power);
+export const isReactiveIlluminanceInfo = createSensorTypeGuard<ReactiveIlluminanceInfo>(SensorType.Illuminance);
+export const isReactiveCarbonDioxideInfo = createSensorTypeGuard<ReactiveCarbonDioxideInfo>(SensorType.CarbonDioxide);
 export const isReactiveGarageControl = createSensorTypeGuard<ReactiveGarageControl>(SensorType.Garage);
 
 export interface ReactiveSensorManager {
