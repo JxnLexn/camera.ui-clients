@@ -30,7 +30,8 @@
     ],
   },
   "include": [
-    "src/**/*"
+    "src/**/*",
+    "../../externals/camera.ui/server/types/*.d.ts"
   ],
   "exclude": [
     "node_modules",
