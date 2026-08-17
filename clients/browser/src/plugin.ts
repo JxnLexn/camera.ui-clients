@@ -32,6 +32,7 @@ function makeContextFromTransport(input: CameraUiPluginInput): CameraUiContext {
   let hasBeenConnected = natsTransport.getClient() !== null;
   let lastClient: RPCClient | null = natsTransport.getClient();
   let downTimer: ReturnType<typeof setTimeout> | null = null;
+  let sawDrop = false;
 
   const rpc = shallowRef<RPCClient | undefined>(natsTransport.getClient() ?? undefined);
   const isConnected = ref(natsTransport.getClient()?.isConnected ?? false);
@@ -84,15 +85,22 @@ function makeContextFromTransport(input: CameraUiPluginInput): CameraUiContext {
       rpc.value = next;
       isConnected.value = true;
       error.value = undefined;
-      // a blip shorter than the debounce with the SAME client needs no refresh
-      // (the nats lib re-issues its subscriptions itself) — a new client always
-      // does, its server-side state is connId-fresh
+      // a blip shorter than the debounce with the SAME client keeps its plugin
+      // proxies (the nats lib re-issues its subscriptions itself) — a new
+      // client always needs the full refresh, its server-side state is
+      // connId-fresh. NATS core is at-most-once though: messages published
+      // during ANY gap are gone, so even the blip must emit 'reconnected' for
+      // data consumers to backfill.
       if (!wasConnected || clientChanged) {
         refreshClientSubscriptions();
         if (hasBeenConnected) emit('reconnected');
         hasBeenConnected = true;
+      } else if (sawDrop && hasBeenConnected) {
+        emit('reconnected');
       }
+      sawDrop = false;
     } else {
+      sawDrop = true;
       rpc.value = undefined;
       if (downTimer !== null || !isConnected.value) return;
       downTimer = setTimeout(() => {
