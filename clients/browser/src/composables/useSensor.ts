@@ -1002,7 +1002,20 @@ export function useAllSensors(): UseSensorsReturn {
   return { sensors, isLoading: computed(() => _isLoading.value || !initialLoadDone.value), error };
 }
 
-function useTypedSensor<T extends ReactiveSensor<any>>(camera: CameraIdentifier, sensorType: SensorType): UseSensorTypedReturn<T> {
+function pickSensorOfType(sensors: ReactiveSensor[], sensorType: SensorType, preferredPluginId?: string): ReactiveSensor | undefined {
+  const typed = sensors.filter((sensor) => sensor.type === sensorType);
+  if (preferredPluginId) {
+    const preferred = typed.find((sensor) => sensor.pluginId === preferredPluginId);
+    if (preferred) return preferred;
+  }
+  return typed[0];
+}
+
+function useTypedSensor<T extends ReactiveSensor<any>>(
+  camera: CameraIdentifier,
+  sensorType: SensorType,
+  preferredPluginId?: MaybeRefOrGetter<string | undefined>,
+): UseSensorTypedReturn<T> {
   const cameraUi = useCameraUi();
   const { isConnected } = cameraUi;
   const sensor = shallowRef<T | undefined>();
@@ -1013,12 +1026,12 @@ function useTypedSensor<T extends ReactiveSensor<any>>(camera: CameraIdentifier,
   const state = createSensorComposableState();
 
   watch(
-    [isConnected, () => extractCameraId(toValue(camera))],
-    async ([connected, camId]) => {
+    [isConnected, () => extractCameraId(toValue(camera)), () => toValue(preferredPluginId)],
+    async ([connected, camId, preferred]) => {
       if (connected && camId) {
         const manager = await ensureSensorManager(state, cameraUi, connected, _isLoading, error);
         cachedManager.value = manager;
-        sensor.value = manager ? (sensorsForCamera(manager, camId).find((s) => s.type === sensorType) as T | undefined) : undefined;
+        sensor.value = manager ? (pickSensorOfType(sensorsForCamera(manager, camId), sensorType, preferred) as T | undefined) : undefined;
         initialLoadDone.value = true;
       } else {
         // Camera id flipped to undefined (caller gated the composable).
@@ -1037,12 +1050,12 @@ function useTypedSensor<T extends ReactiveSensor<any>>(camera: CameraIdentifier,
       if (!cachedManager.value) return undefined;
       const camId = extractCameraId(toValue(camera));
       if (!camId) return undefined;
-      return sensorsForCamera(cachedManager.value, camId).find((s) => s.type === sensorType)?.id;
+      return pickSensorOfType(sensorsForCamera(cachedManager.value, camId), sensorType, toValue(preferredPluginId))?.id;
     },
     () => {
       if (cachedManager.value) {
         const camId = extractCameraId(toValue(camera));
-        sensor.value = camId ? (sensorsForCamera(cachedManager.value, camId).find((s) => s.type === sensorType) as T | undefined) : undefined;
+        sensor.value = camId ? (pickSensorOfType(sensorsForCamera(cachedManager.value, camId), sensorType, toValue(preferredPluginId)) as T | undefined) : undefined;
       }
     },
   );
@@ -1055,24 +1068,27 @@ function useTypedSensor<T extends ReactiveSensor<any>>(camera: CameraIdentifier,
   return { sensor: sensor as ShallowRef<T | undefined>, isLoading: computed(() => _isLoading.value || !initialLoadDone.value), error };
 }
 
-export function useMotionSensor(camera: CameraIdentifier): UseSensorTypedReturn<ReactiveMotionSensor> {
-  return useTypedSensor<ReactiveMotionSensor>(camera, SensorType.Motion);
+export function useMotionSensor(camera: CameraIdentifier, preferredPluginId?: MaybeRefOrGetter<string | undefined>): UseSensorTypedReturn<ReactiveMotionSensor> {
+  return useTypedSensor<ReactiveMotionSensor>(camera, SensorType.Motion, preferredPluginId);
 }
 
-export function useObjectSensor(camera: CameraIdentifier): UseSensorTypedReturn<ReactiveObjectSensor> {
-  return useTypedSensor<ReactiveObjectSensor>(camera, SensorType.Object);
+export function useObjectSensor(camera: CameraIdentifier, preferredPluginId?: MaybeRefOrGetter<string | undefined>): UseSensorTypedReturn<ReactiveObjectSensor> {
+  return useTypedSensor<ReactiveObjectSensor>(camera, SensorType.Object, preferredPluginId);
 }
 
-export function useFaceSensor(camera: CameraIdentifier): UseSensorTypedReturn<ReactiveFaceSensor> {
-  return useTypedSensor<ReactiveFaceSensor>(camera, SensorType.Face);
+export function useFaceSensor(camera: CameraIdentifier, preferredPluginId?: MaybeRefOrGetter<string | undefined>): UseSensorTypedReturn<ReactiveFaceSensor> {
+  return useTypedSensor<ReactiveFaceSensor>(camera, SensorType.Face, preferredPluginId);
 }
 
-export function useLicensePlateSensor(camera: CameraIdentifier): UseSensorTypedReturn<ReactiveLicensePlateSensor> {
-  return useTypedSensor<ReactiveLicensePlateSensor>(camera, SensorType.LicensePlate);
+export function useLicensePlateSensor(
+  camera: CameraIdentifier,
+  preferredPluginId?: MaybeRefOrGetter<string | undefined>,
+): UseSensorTypedReturn<ReactiveLicensePlateSensor> {
+  return useTypedSensor<ReactiveLicensePlateSensor>(camera, SensorType.LicensePlate, preferredPluginId);
 }
 
-export function useAudioSensor(camera: CameraIdentifier): UseSensorTypedReturn<ReactiveAudioSensor> {
-  return useTypedSensor<ReactiveAudioSensor>(camera, SensorType.Audio);
+export function useAudioSensor(camera: CameraIdentifier, preferredPluginId?: MaybeRefOrGetter<string | undefined>): UseSensorTypedReturn<ReactiveAudioSensor> {
+  return useTypedSensor<ReactiveAudioSensor>(camera, SensorType.Audio, preferredPluginId);
 }
 
 export function usePTZControl(camera: CameraIdentifier): UseSensorTypedReturn<ReactivePTZControl> {
