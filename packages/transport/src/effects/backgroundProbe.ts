@@ -5,7 +5,7 @@ import type { ConnectionTarget, Endpoint, Tokens } from '../core/types.js';
 import type { RaceCandidate, TimeoutByModeFn } from '../race.js';
 import type { ProbeContext } from './probeLoop.js';
 
-export type BackgroundProbeOutcome = 'swap' | 'same' | 'failed' | 'skipped';
+export type BackgroundProbeOutcome = 'swap' | 'same' | 'kept' | 'failed' | 'skipped';
 
 export interface BackgroundProbeOptions {
   readonly kernel: Kernel;
@@ -15,6 +15,7 @@ export interface BackgroundProbeOptions {
   readonly timeoutByMode?: TimeoutByModeFn;
   readonly prefer?: (endpoint: Endpoint) => boolean;
   readonly preferGraceMs?: number;
+  readonly isCurrentHealthy?: () => boolean;
   readonly onResult?: (outcome: BackgroundProbeOutcome, detail?: string) => void;
 }
 
@@ -57,7 +58,14 @@ export function createBackgroundProbe(options: BackgroundProbeOptions): Backgrou
         options.onResult?.('skipped', `phase=${phase.kind}`);
         return 'skipped';
       }
-      const same = phase.target.endpoint.url === endpoint.url && phase.target.endpoint.mode === endpoint.mode;
+      const current = phase.target.endpoint;
+      const same = current.url === endpoint.url && current.mode === endpoint.mode;
+      // right after a network switch the race can misfire while the new
+      // interface is still settling, never downgrade a healthy preferred path
+      if (!same && options.prefer && options.prefer(current) && !options.prefer(endpoint) && options.isCurrentHealthy?.() === true) {
+        options.onResult?.('kept', current.url);
+        return 'kept';
+      }
       options.kernel.dispatch({ type: 'ENDPOINT_SWAP', endpoint, tokens });
       const outcome = same ? 'same' : 'swap';
       options.onResult?.(outcome, endpoint.url);

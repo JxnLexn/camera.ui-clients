@@ -51,6 +51,59 @@ describe('createBackgroundProbe', () => {
     expect(onResult).toHaveBeenCalledWith('same', WAN.url);
   });
 
+  it('keeps a healthy preferred target when only a non-preferred endpoint wins', async () => {
+    const kernel = createKernel({ context: makeCtx(), initial: onlinePhase(LAN) });
+    const onResult = vi.fn();
+    const bg = createBackgroundProbe({
+      kernel,
+      discover: async () => [WAN, LAN],
+      probe: async ({ endpoint }) => {
+        if (endpoint.mode === 'direct-lan') throw new Error('interface still settling');
+        return TOKENS;
+      },
+      prefer: (ep) => ep.mode === 'direct-lan',
+      isCurrentHealthy: () => true,
+      onResult,
+    });
+
+    await expect(bg.run()).resolves.toBe('kept');
+    expect(kernel.phase.kind === 'online' && kernel.phase.target.endpoint.url).toBe(LAN.url);
+    expect(onResult).toHaveBeenCalledWith('kept', LAN.url);
+  });
+
+  it('downgrades when the current preferred target is unhealthy', async () => {
+    const kernel = createKernel({ context: makeCtx(), initial: onlinePhase(LAN) });
+    const bg = createBackgroundProbe({
+      kernel,
+      discover: async () => [WAN, LAN],
+      probe: async ({ endpoint }) => {
+        if (endpoint.mode === 'direct-lan') throw new Error('unreachable');
+        return TOKENS;
+      },
+      prefer: (ep) => ep.mode === 'direct-lan',
+      isCurrentHealthy: () => false,
+    });
+
+    await expect(bg.run()).resolves.toBe('swap');
+    expect(kernel.phase.kind === 'online' && kernel.phase.target.endpoint.url).toBe(WAN.url);
+  });
+
+  it('downgrades without a health check (legacy behavior)', async () => {
+    const kernel = createKernel({ context: makeCtx(), initial: onlinePhase(LAN) });
+    const bg = createBackgroundProbe({
+      kernel,
+      discover: async () => [WAN, LAN],
+      probe: async ({ endpoint }) => {
+        if (endpoint.mode === 'direct-lan') throw new Error('unreachable');
+        return TOKENS;
+      },
+      prefer: (ep) => ep.mode === 'direct-lan',
+    });
+
+    await expect(bg.run()).resolves.toBe('swap');
+    expect(kernel.phase.kind === 'online' && kernel.phase.target.endpoint.url).toBe(WAN.url);
+  });
+
   it('a failed round changes nothing', async () => {
     const kernel = createKernel({ context: makeCtx(), initial: onlinePhase(WAN) });
     const before = kernel.phase;
