@@ -44,7 +44,7 @@
     "unplugin-dts": "^1.0.3",
     "updates": "^18.0.1",
     "vite": "^8.2.1",
-    "vitest": "^4.1.10"
+    "vitest": "^4.1.11"
   },
   "bugs": {
     "url": "https://github.com/cameraui/clients/issues"
