@@ -49,13 +49,18 @@ function createReactiveStorage(proxy: Promisify<StorageRPC>): ReactiveStorage {
   const config = shallowRef<SchemaConfig | undefined>();
   const isLoading = ref(false);
   const error = ref<Error | undefined>();
+  let inFlightConfig: Promise<SchemaConfig | undefined> | null = null;
 
   async function getConfig(): Promise<SchemaConfig | undefined> {
+    if (inFlightConfig) return inFlightConfig;
     isLoading.value = true;
     error.value = undefined;
 
     try {
-      config.value = await proxy.getConfig();
+      inFlightConfig = proxy.getConfig().finally(() => {
+        inFlightConfig = null;
+      });
+      config.value = await inFlightConfig;
       return config.value;
     } catch (err) {
       error.value = err instanceof Error ? err : new Error(String(err));
