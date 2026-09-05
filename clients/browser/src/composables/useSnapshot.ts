@@ -22,9 +22,49 @@ const snapshotCache = new Map<string, ArrayBuffer>();
 const timestampCache = new Map<string, number>();
 const urlCache = new Map<string, string>();
 const subscribers = new Map<string, Set<() => void>>();
+const pendingLoads = new Map<string, Promise<ArrayBuffer | undefined>>();
 
 function notify(cameraId: string): void {
   subscribers.get(cameraId)?.forEach((cb) => cb());
+}
+
+function fetchSnapshotShared(deviceManager: ReturnType<typeof useDeviceManager>, id: string, forceFresh = false): Promise<ArrayBuffer | undefined> {
+  const pending = pendingLoads.get(id);
+  if (pending) return pending;
+
+  const promise = (async (): Promise<ArrayBuffer | undefined> => {
+    const device = await acquireCameraDevice(deviceManager, id);
+    try {
+      if (!device) return undefined;
+      const result = await device.fetchSnapshot(undefined, forceFresh ? true : undefined);
+      if (result) setSnapshot(id, result);
+      return result ?? undefined;
+    } finally {
+      if (device) releaseCameraDevice(id);
+    }
+  })().finally(() => pendingLoads.delete(id));
+
+  pendingLoads.set(id, promise);
+  return promise;
+}
+
+let reconnectHooked = false;
+
+function hookReconnectRefresh(cameraUi: ReturnType<typeof useCameraUi>, deviceManager: ReturnType<typeof useDeviceManager>): void {
+  if (reconnectHooked) return;
+  reconnectHooked = true;
+  cameraUi.on('reconnected', () => {
+    let delay = 0;
+    for (const id of subscribers.keys()) {
+      if ((subscribers.get(id)?.size ?? 0) === 0) continue;
+      const cameraId = id;
+      setTimeout(() => {
+        if ((subscribers.get(cameraId)?.size ?? 0) === 0) return;
+        void fetchSnapshotShared(deviceManager, cameraId).catch(() => undefined);
+      }, delay);
+      delay += 150;
+    }
+  });
 }
 
 function deferRevoke(url: string): void {
@@ -93,6 +133,8 @@ export function useSnapshot(cameraIdOrName: MaybeRefOrGetter<string | DBCamera>)
   const snapshot = shallowRef<ArrayBuffer | undefined>();
   const _isLoading = ref(false);
   const initialLoadDone = ref(false);
+
+  hookReconnectRefresh(cameraUi, deviceManager);
 
   const snapshotSrc = computed(() => {
     // Touch `snapshot.value` for reactivity, then resolve via the cameraId
@@ -172,19 +214,8 @@ export function useSnapshot(cameraIdOrName: MaybeRefOrGetter<string | DBCamera>)
 
     _isLoading.value = true;
     try {
-      const device = await acquireCameraDevice(deviceManager, id);
-      try {
-        if (device) {
-          const result = await device.fetchSnapshot();
-          if (result) {
-            // The fetch path already stamped the timestamp — don't touch it here.
-            setSnapshot(id, result);
-            snapshot.value = result;
-          }
-        }
-      } finally {
-        if (device) releaseCameraDevice(id);
-      }
+      const result = await fetchSnapshotShared(deviceManager, id);
+      if (result) snapshot.value = result;
     } catch {
       // Camera may be offline / RPC timeout — silently ignore
     } finally {
@@ -208,18 +239,8 @@ export function useSnapshot(cameraIdOrName: MaybeRefOrGetter<string | DBCamera>)
 
     _isLoading.value = true;
     try {
-      const device = await acquireCameraDevice(deviceManager, id);
-      try {
-        if (device) {
-          const result = await device.fetchSnapshot(undefined, true);
-          if (result) {
-            setSnapshot(id, result);
-            snapshot.value = result;
-          }
-        }
-      } finally {
-        if (device) releaseCameraDevice(id);
-      }
+      const result = await fetchSnapshotShared(deviceManager, id, true);
+      if (result) snapshot.value = result;
     } catch {
       // Camera may be offline / RPC timeout — silently ignore
     } finally {
@@ -254,17 +275,7 @@ export function useSnapshot(cameraIdOrName: MaybeRefOrGetter<string | DBCamera>)
     { immediate: true },
   );
 
-  const onReconnected = (): void => {
-    const idOrName = toValue(cameraIdOrName);
-    if (isCameraDisabled(idOrName)) return;
-    const id = typeof idOrName === 'string' ? idOrName : idOrName._id;
-    if (id) loadSnapshot(id, true);
-  };
-
-  cameraUi.on('reconnected', onReconnected);
-
   tryOnScopeDispose(() => {
-    cameraUi.off('reconnected', onReconnected);
     unsubscribe?.();
     releaseHeldDevice();
   });
