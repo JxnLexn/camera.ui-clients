@@ -39,7 +39,7 @@
   "devDependencies": {
     "@camera.ui/logger": "file:../../packages/logger",
     "@camera.ui/rpc": "^1.0.12",
-    "@camera.ui/sdk": "~1.2.35",
+    "@camera.ui/sdk": "~1.2.36",
     "@camera.ui/transport": "file:../../packages/transport",
     "@eneris/push-receiver": "^4.3.1",
     "@microsoft/api-extractor": "^7.59.1",
@@ -62,7 +62,7 @@
     "typescript-eslint": "^8.70.0",
     "unplugin-dts": "^1.1.0",
     "updates": "^18.1.0",
-    "vite": "^8.2.2",
+    "vite": "^8.3.0",
     "vitest": "^5.0.0",
     "vue": "^3.5.42",
     "vue-tsc": "^3.3.11"
