@@ -31,6 +31,14 @@ export interface StreamConnectionOptions {
 
 const log = new Logger('StreamConnection');
 
+function isVideoInPictureInPicture(video: HTMLVideoElement | undefined | null): boolean {
+  if (!video) return false;
+  if (typeof document !== 'undefined' && 'pictureInPictureElement' in document && document.pictureInPictureElement === video) {
+    return true;
+  }
+  return (video as { webkitPresentationMode?: string }).webkitPresentationMode === 'picture-in-picture';
+}
+
 export class StreamConnection implements ReactiveStream {
   public readonly status: Ref<StreamStatus>;
   public readonly activeMode: Ref<Exclude<VideoStreamingMode, 'auto'>>;
@@ -65,6 +73,7 @@ export class StreamConnection implements ReactiveStream {
   private abortController = new AbortController();
   private probedSourceId: string | undefined;
   private wasPausedByVisibility = false;
+  private disarmPipWatch: (() => void) | null = null;
   private wsHandle: WsHandle | undefined;
   private webrtcHandler: WebRTCHandler | undefined;
   private mseHandler: MSEHandler | undefined;
@@ -204,6 +213,11 @@ export class StreamConnection implements ReactiveStream {
           log.debug(`onTabPaused — already in ${this.status.value}, skipping stop()`);
           return;
         }
+        if (isVideoInPictureInPicture(this.videoElement.value)) {
+          log.debug('onTabPaused — video is in picture-in-picture, keeping the stream');
+          this.watchPipLeave();
+          return;
+        }
         this.wasPausedByVisibility = true;
         this.stop();
         log.debug('onTabPaused — stop() done, wasPausedByVisibility=true');
@@ -213,6 +227,7 @@ export class StreamConnection implements ReactiveStream {
         log.debug(
           `onTabVisible fired — wasPausedByVisibility=${this.wasPausedByVisibility}, status=${this.status.value}, isReady=${this.isReady.value}, target=${!!this.target.value}`,
         );
+        this.disarmPipWatch?.();
         if (!this.wasPausedByVisibility) {
           log.debug('onTabVisible — not paused by visibility, no-op');
           return;
@@ -233,6 +248,29 @@ export class StreamConnection implements ReactiveStream {
         );
       }
     });
+  }
+
+  private watchPipLeave(): void {
+    if (this.disarmPipWatch) return;
+    const video = this.videoElement.value;
+    if (!video) return;
+
+    const onLeave = () => {
+      if (isVideoInPictureInPicture(video)) return;
+      this.disarmPipWatch?.();
+      if (typeof document !== 'undefined' && document.visibilityState === 'visible') return;
+      if (this.status.value === 'idle' || this.status.value === 'closed') return;
+      log.debug('picture-in-picture closed while tab hidden — stopping the stream');
+      this.wasPausedByVisibility = true;
+      this.stop();
+    };
+    video.addEventListener('leavepictureinpicture', onLeave);
+    video.addEventListener('webkitpresentationmodechanged', onLeave);
+    this.disarmPipWatch = () => {
+      video.removeEventListener('leavepictureinpicture', onLeave);
+      video.removeEventListener('webkitpresentationmodechanged', onLeave);
+      this.disarmPipWatch = null;
+    };
   }
 
   public async start(): Promise<void> {
@@ -430,6 +468,7 @@ export class StreamConnection implements ReactiveStream {
     this.offTabVisible = undefined;
     this.offTabPaused?.();
     this.offTabPaused = undefined;
+    this.disarmPipWatch?.();
 
     const video = this.videoElement.value;
     if (video) {
