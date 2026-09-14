@@ -151,8 +151,7 @@ export async function createReactiveCameraDevice(rpcOrContext: RPCClient | React
         frameWorkerConnected.value = event.data;
         break;
       case 'snapshot:updated':
-        // Pushes are always fresh — the server fetches with forceNew before emitting.
-        setSnapshot(initialCamera._id, event.data.snapshot, Date.now());
+        setSnapshot(initialCamera._id, event.data.snapshot, event.data.fetchedAt);
         break;
     }
   }
