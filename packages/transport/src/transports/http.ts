@@ -19,6 +19,7 @@ export interface HttpTransportOptions {
   readonly apiPrefix?: string;
   readonly timeoutMs?: number;
   readonly targetWaitMs?: number;
+  readonly authRetryWaitMs?: number;
   readonly spec?: Partial<TransportSpec>;
   readonly authorize?: HttpAuthorizer;
   readonly logger?: Logger;
@@ -29,6 +30,15 @@ interface TargetWaiter {
   reject: (reason: unknown) => void;
 }
 
+interface AccessWaiter extends TargetWaiter {
+  staleAccess: string;
+}
+
+interface AuthRetryConfig extends InternalAxiosRequestConfig {
+  _sentAccess?: string;
+  _authRetried?: boolean;
+}
+
 export interface HttpTransport extends Transport {
   readonly client: AxiosInstance;
 }
@@ -37,6 +47,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
   const spec: TransportSpec = { ...HTTP_SPEC, ...options.spec };
   const apiPrefix = options.apiPrefix ?? '/api';
   const targetWaitMs = options.targetWaitMs ?? 15_000;
+  const authRetryWaitMs = options.authRetryWaitMs ?? 10_000;
   const logger = options.logger;
 
   const emitter = new TransportEmitter();
@@ -45,6 +56,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
   let status: TransportStatus = { up: false };
   let disposed = false;
   const targetWaiters = new Set<TargetWaiter>();
+  const accessWaiters = new Set<AccessWaiter>();
 
   const client = axios.create({
     timeout: options.timeoutMs ?? 30_000,
@@ -84,6 +96,46 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
     for (const waiter of [...targetWaiters]) waiter.resolve();
   }
 
+  function waitForNewAccess(staleAccess: string, signal?: GenericAbortSignal): Promise<void> {
+    if (currentTarget && currentTarget.tokens.access !== staleAccess) return Promise.resolve();
+    return new Promise<void>((resolve, reject) => {
+      const waiter: AccessWaiter = {
+        staleAccess,
+        resolve: () => {
+          cleanup();
+          resolve();
+        },
+        reject: (reason) => {
+          cleanup();
+          reject(reason);
+        },
+      };
+      const timer = setTimeout(() => waiter.reject(new Error('http-transport: token refresh timed out')), authRetryWaitMs);
+      const onAbort = (): void => waiter.reject(new axios.Cancel('http-transport: aborted'));
+      function cleanup(): void {
+        clearTimeout(timer);
+        accessWaiters.delete(waiter);
+        signal?.removeEventListener?.('abort', onAbort);
+      }
+      if (signal?.aborted) {
+        waiter.reject(new axios.Cancel('http-transport: aborted'));
+        return;
+      }
+      signal?.addEventListener?.('abort', onAbort);
+      accessWaiters.add(waiter);
+    });
+  }
+
+  function flushAccessWaiters(): void {
+    for (const waiter of [...accessWaiters]) {
+      if (!currentTarget) {
+        waiter.reject(new axios.Cancel('http-transport: no target'));
+      } else if (currentTarget.tokens.access !== waiter.staleAccess) {
+        waiter.resolve();
+      }
+    }
+  }
+
   client.interceptors.request.use(async (config: InternalAxiosRequestConfig) => {
     if (!currentTarget) {
       await waitForTarget(config.signal);
@@ -92,6 +144,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
     if (!target) {
       throw new axios.Cancel('http-transport: no target');
     }
+    (config as AuthRetryConfig)._sentAccess = target.tokens.access;
     if (!config.baseURL) {
       config.baseURL = `${target.endpoint.url}${apiPrefix}`;
     }
@@ -115,7 +168,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
       }
       return response;
     },
-    (error: AxiosError) => {
+    async (error: AxiosError) => {
       if (axios.isCancel(error)) return Promise.reject(error);
       if (!error.response) {
         markDown(error.message ?? 'network');
@@ -124,6 +177,18 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
       if (error.response.status === 401) {
         logger?.debug(`auth-error 401 (${error.config?.url ?? 'unknown-url'})`);
         emitter.emit('auth-error', { status: 401, message: extractMessage(error) });
+
+        const config = error.config as AuthRetryConfig | undefined;
+        if (config?._sentAccess && !config._authRetried && !disposed) {
+          config._authRetried = true;
+          try {
+            await waitForNewAccess(config._sentAccess, config.signal);
+          } catch {
+            return Promise.reject(error);
+          }
+          logger?.debug(`retry after token refresh (${config.url ?? 'unknown-url'})`);
+          return client(config);
+        }
       }
       return Promise.reject(error);
     },
@@ -147,6 +212,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
     if (!target) {
       status = { up: false };
       emitter.emit('down', { reason: 'detached' });
+      flushAccessWaiters();
       return;
     }
 
@@ -155,6 +221,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
     }
 
     flushTargetWaiters();
+    flushAccessWaiters();
   }
 
   function health(): TransportStatus {
@@ -170,6 +237,7 @@ export function createHttpTransport(options: HttpTransportOptions = {}): HttpTra
     currentTarget = null;
     status = { up: false };
     for (const waiter of [...targetWaiters]) waiter.reject(new axios.Cancel('http-transport: disposed'));
+    for (const waiter of [...accessWaiters]) waiter.reject(new axios.Cancel('http-transport: disposed'));
     emitter.clear();
   }
 

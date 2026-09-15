@@ -144,7 +144,7 @@ describe('createHttpTransport — request interceptor', () => {
   });
 
   it('401 emits auth-error', async () => {
-    const t = createHttpTransport();
+    const t = createHttpTransport({ authRetryWaitMs: 30 });
     await t.apply(T1);
     const authError = vi.fn();
     t.on('auth-error', authError);
@@ -195,5 +195,79 @@ describe('createHttpTransport — authorize hook', () => {
     expect(config.baseURL).toBe('https://nvr.example.com/api');
     expect(String(config.headers.Authorization)).toBe('Bearer ha-token');
     expect(String(config.headers['X-Proxy-Session'])).toBe('ps-1');
+  });
+});
+
+describe('createHttpTransport — 401 retry after token refresh', () => {
+  const T1b: ConnectionTarget = { ...T1, tokens: { access: 'at-2' } };
+
+  function adapterRejecting(access: string) {
+    return vi.fn(async (config: any) => {
+      if (String(config.headers.Authorization) === `Bearer ${access}`) {
+        const err: any = new Error('Request failed with status code 401');
+        err.config = config;
+        err.response = { status: 401, data: { message: 'Token expired' }, headers: {}, config };
+        err.isAxiosError = true;
+        throw err;
+      }
+      return { data: { ok: true }, status: 200, statusText: 'OK', headers: {}, config };
+    });
+  }
+
+  it('waits for the refreshed target and retries once', async () => {
+    const t = createHttpTransport({ authRetryWaitMs: 1000 });
+    await t.apply(T1);
+    const adapter = adapterRejecting('at-1');
+    t.client.defaults.adapter = adapter as any;
+    const authError = vi.fn();
+    t.on('auth-error', authError);
+
+    const p = t.client.get('/cameras');
+    await new Promise((r) => setTimeout(r, 10));
+    expect(authError).toHaveBeenCalledWith({ status: 401, message: 'Token expired' });
+    await t.apply(T1b);
+
+    const res = await p;
+    expect(res.data).toEqual({ ok: true });
+    expect(adapter).toHaveBeenCalledTimes(2);
+    expect(String(adapter.mock.calls[1]![0].headers.Authorization)).toBe('Bearer at-2');
+  });
+
+  it('retries right away when the token rotated while the request was in flight', async () => {
+    const t = createHttpTransport({ authRetryWaitMs: 1000 });
+    await t.apply(T1);
+    const adapter = adapterRejecting('at-1');
+    t.client.defaults.adapter = vi.fn(async (config: any) => {
+      // rotation lands between send and response
+      await t.apply(T1b);
+      return adapter(config);
+    }) as any;
+
+    const res = await t.client.get('/cameras');
+    expect(res.data).toEqual({ ok: true });
+    expect(adapter).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects with the original 401 when no fresh token arrives in time', async () => {
+    const t = createHttpTransport({ authRetryWaitMs: 30 });
+    await t.apply(T1);
+    const adapter = adapterRejecting('at-1');
+    t.client.defaults.adapter = adapter as any;
+
+    await expect(t.client.get('/cameras')).rejects.toMatchObject({ response: { status: 401 } });
+    expect(adapter).toHaveBeenCalledTimes(1);
+  });
+
+  it('gives up when the target is detached during the wait', async () => {
+    const t = createHttpTransport({ authRetryWaitMs: 1000 });
+    await t.apply(T1);
+    const adapter = adapterRejecting('at-1');
+    t.client.defaults.adapter = adapter as any;
+
+    const p = t.client.get('/cameras');
+    await new Promise((r) => setTimeout(r, 10));
+    await t.apply(null);
+    await expect(p).rejects.toMatchObject({ response: { status: 401 } });
+    expect(adapter).toHaveBeenCalledTimes(1);
   });
 });
