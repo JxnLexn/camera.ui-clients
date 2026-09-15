@@ -36,8 +36,8 @@ function fetchSnapshotShared(deviceManager: ReturnType<typeof useDeviceManager>,
     const device = await acquireCameraDevice(deviceManager, id);
     try {
       if (!device) return undefined;
+      // the device stores the result itself
       const result = await device.fetchSnapshot(undefined, forceFresh ? true : undefined);
-      if (result) setSnapshot(id, result);
       return result ?? undefined;
     } finally {
       if (device) releaseCameraDevice(id);
@@ -54,16 +54,19 @@ function hookReconnectRefresh(cameraUi: ReturnType<typeof useCameraUi>, deviceMa
   if (reconnectHooked) return;
   reconnectHooked = true;
   cameraUi.on('reconnected', () => {
-    let delay = 0;
-    for (const id of subscribers.keys()) {
-      if ((subscribers.get(id)?.size ?? 0) === 0) continue;
-      const cameraId = id;
-      setTimeout(() => {
-        if ((subscribers.get(cameraId)?.size ?? 0) === 0) return;
-        void fetchSnapshotShared(deviceManager, cameraId).catch(() => undefined);
-      }, delay);
-      delay += 150;
-    }
+    // the isConnected watchers re-subscribe in the next flush, a synchronous sweep finds every set empty
+    setTimeout(() => {
+      let delay = 0;
+      for (const id of subscribers.keys()) {
+        if ((subscribers.get(id)?.size ?? 0) === 0) continue;
+        const cameraId = id;
+        setTimeout(() => {
+          if ((subscribers.get(cameraId)?.size ?? 0) === 0) return;
+          void fetchSnapshotShared(deviceManager, cameraId).catch(() => undefined);
+        }, delay);
+        delay += 150;
+      }
+    }, 0);
   });
 }
 
@@ -74,13 +77,17 @@ function deferRevoke(url: string): void {
 export function setSnapshot(cameraId: string, data: ArrayBuffer, fetchedAt?: number): void {
   // Buffer is being replaced — schedule revocation of the old blob URL so the
   // next read produces a fresh URL bound to the new bytes, but keep the old
-  // URL valid long enough for any pending img fetches to complete.
-  const oldUrl = urlCache.get(cameraId);
-  if (oldUrl) {
-    deferRevoke(oldUrl);
-    urlCache.delete(cameraId);
+  // URL valid long enough for any pending img fetches to complete. The same
+  // buffer keeps its URL: cards that render it never see a new value, so a
+  // revoked URL would stay their src and break once the WebView re-reads it.
+  if (snapshotCache.get(cameraId) !== data) {
+    const oldUrl = urlCache.get(cameraId);
+    if (oldUrl) {
+      deferRevoke(oldUrl);
+      urlCache.delete(cameraId);
+    }
+    snapshotCache.set(cameraId, data);
   }
-  snapshotCache.set(cameraId, data);
   // Without a known fetch time (e.g. legacy servers serving their TTL cache)
   // the previous stamp is left untouched — never guess Date.now().
   if (fetchedAt !== undefined) {
