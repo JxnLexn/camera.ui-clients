@@ -7,7 +7,7 @@ import { clearPluginIdCache, resolvePluginId } from './resolvePluginId.js';
 import { useCameraUi } from './useCameraUi.js';
 import { extractCameraId } from './utils.js';
 
-import type { Promisify } from '@camera.ui/rpc';
+import type { Promisify, RPCClient } from '@camera.ui/rpc';
 import type { FormSubmitResponse, SchemaConfig } from '@camera.ui/sdk';
 import type { ComputedRef, MaybeRefOrGetter, Ref, ShallowRef } from 'vue';
 import type { CameraIdentifier } from './utils.js';
@@ -25,6 +25,7 @@ export interface StorageRPC {
 
 export interface ReactiveStorage {
   readonly proxy: Promisify<StorageRPC>;
+  readonly client: RPCClient;
   readonly config: ShallowRef<SchemaConfig | undefined>;
   readonly isLoading: Ref<boolean>;
   readonly error: Ref<Error | undefined>;
@@ -45,7 +46,7 @@ export interface UseStorageReturn {
   isConnected: Ref<boolean>;
 }
 
-function createReactiveStorage(proxy: Promisify<StorageRPC>): ReactiveStorage {
+function createReactiveStorage(proxy: Promisify<StorageRPC>, client: RPCClient): ReactiveStorage {
   const config = shallowRef<SchemaConfig | undefined>();
   const isLoading = ref(false);
   const error = ref<Error | undefined>();
@@ -122,6 +123,7 @@ function createReactiveStorage(proxy: Promisify<StorageRPC>): ReactiveStorage {
 
   return {
     proxy,
+    client,
     config,
     isLoading,
     error,
@@ -148,11 +150,12 @@ function getSensorStorageKey(pluginId: string, sensorId: string): string {
   return `plugin:${pluginId}:sensor:${sensorId}`;
 }
 
-function acquireStorage(key: string, createProxy: () => Promisify<StorageRPC>): ReactiveStorage {
-  return storageCache.acquire(key, () => {
-    const proxy = createProxy();
-    return createReactiveStorage(proxy);
-  });
+function acquireStorage(key: string, client: RPCClient, createProxy: () => Promisify<StorageRPC>): ReactiveStorage {
+  // a proxy answers only on the client it was created on, an entry left over
+  // from a rebuilt connection would fail every call
+  const cached = storageCache.get(key);
+  if (cached && cached.client !== client) storageCache.forceRelease(key);
+  return storageCache.acquire(key, () => createReactiveStorage(createProxy(), client));
 }
 
 function releaseStorage(key: string): void {
@@ -186,7 +189,26 @@ function cleanupStorage(state: StorageComposableState, isConnected: Ref<boolean>
   config.value = undefined;
 }
 
-const GET_CONFIG_RETRY_DELAYS = [2_000, 5_000, 10_000, 15_000];
+function bindStorage(
+  state: StorageComposableState,
+  storageKey: string,
+  client: RPCClient,
+  config: ShallowRef<SchemaConfig | undefined>,
+  createProxy: () => Promisify<StorageRPC>,
+): void {
+  if (state.currentStorageKey === storageKey && state.cachedStorage?.client === client) return;
+
+  if (state.currentStorageKey && state.currentStorageKey !== storageKey) {
+    releaseStorage(state.currentStorageKey);
+    // the previous plugin's form must not stay on screen while the next one loads
+    config.value = undefined;
+  }
+
+  state.currentStorageKey = storageKey;
+  state.cachedStorage = acquireStorage(storageKey, client, createProxy);
+}
+
+const GET_CONFIG_RETRY_DELAYS = [2_000, 5_000, 10_000, 15_000, 15_000, 15_000, 15_000, 15_000];
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -304,7 +326,8 @@ function createStorageOperations(state: StorageComposableState, config: ShallowR
 }
 
 export function usePluginStorage(pluginName: MaybeRefOrGetter<string>): UseStorageReturn {
-  const { rpc, isConnected: clientConnected } = useCameraUi();
+  const cameraUi = useCameraUi();
+  const { rpc, isConnected: clientConnected } = cameraUi;
 
   const config = shallowRef<SchemaConfig | undefined>();
   const _isLoading = ref(false);
@@ -316,7 +339,8 @@ export function usePluginStorage(pluginName: MaybeRefOrGetter<string>): UseStora
   const operations = createStorageOperations(state, config, _isLoading, error);
 
   async function connect(name: string): Promise<boolean> {
-    if (!rpc.value || !clientConnected.value) return false;
+    const client = rpc.value;
+    if (!client || !clientConnected.value) return false;
 
     try {
       const pluginId = await resolvePluginId(rpc, name);
@@ -324,16 +348,9 @@ export function usePluginStorage(pluginName: MaybeRefOrGetter<string>): UseStora
         throw new Error(`Plugin "${name}" not found`);
       }
 
-      const storageKey = getPluginStorageKey(pluginId);
-
-      if (state.currentStorageKey && state.currentStorageKey !== storageKey) {
-        releaseStorage(state.currentStorageKey);
-      }
-
-      state.currentStorageKey = storageKey;
-      state.cachedStorage = acquireStorage(storageKey, () => {
+      bindStorage(state, getPluginStorageKey(pluginId), client, config, () => {
         const namespaces = NamespaceManager.pluginNamespaces(pluginId);
-        return rpc.value!.createProxy<StorageRPC>(namespaces.pluginStorageRpc);
+        return client.createProxy<StorageRPC>(namespaces.pluginStorageRpc);
       });
 
       isConnected.value = true;
@@ -355,22 +372,27 @@ export function usePluginStorage(pluginName: MaybeRefOrGetter<string>): UseStora
     return operations.getConfig();
   }
 
-  watch(
-    [clientConnected, () => toValue(pluginName)],
-    async ([connected, name]) => {
-      if (connected && name) {
-        await connect(name);
-        // Auto-fetch config when storage connects with new params
-        operations.getConfig();
-      } else {
-        cleanupStorage(state, isConnected, config);
-      }
-      initialSetupDone.value = true;
-    },
-    { immediate: true },
-  );
+  async function sync(): Promise<void> {
+    const name = toValue(pluginName);
+    if (clientConnected.value && name) {
+      await connect(name);
+      operations.getConfig();
+    } else {
+      cleanupStorage(state, isConnected, config);
+    }
+    initialSetupDone.value = true;
+  }
 
-  tryOnScopeDispose(() => cleanupStorage(state, isConnected, config));
+  watch([clientConnected, () => toValue(pluginName)], sync, { immediate: true });
+
+  // a short drop never flips clientConnected, the storage still needs the
+  // possibly rebuilt client and a fresh config
+  cameraUi.on('reconnected', sync);
+
+  tryOnScopeDispose(() => {
+    cameraUi.off('reconnected', sync);
+    cleanupStorage(state, isConnected, config);
+  });
 
   return {
     config,
@@ -385,7 +407,8 @@ export function usePluginStorage(pluginName: MaybeRefOrGetter<string>): UseStora
 }
 
 export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefOrGetter<string>): UseStorageReturn {
-  const { rpc, isConnected: clientConnected } = useCameraUi();
+  const cameraUi = useCameraUi();
+  const { rpc, isConnected: clientConnected } = cameraUi;
 
   const config = shallowRef<SchemaConfig | undefined>();
   const _isLoading = ref(false);
@@ -397,7 +420,8 @@ export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefO
   const operations = createStorageOperations(state, config, _isLoading, error);
 
   async function connect(cameraId: string, name: string): Promise<boolean> {
-    if (!rpc.value || !clientConnected.value) return false;
+    const client = rpc.value;
+    if (!client || !clientConnected.value) return false;
 
     try {
       const pluginId = await resolvePluginId(rpc, name);
@@ -405,16 +429,9 @@ export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefO
         throw new Error(`Plugin "${name}" not found`);
       }
 
-      const storageKey = getCameraStorageKey(pluginId, cameraId);
-
-      if (state.currentStorageKey && state.currentStorageKey !== storageKey) {
-        releaseStorage(state.currentStorageKey);
-      }
-
-      state.currentStorageKey = storageKey;
-      state.cachedStorage = acquireStorage(storageKey, () => {
+      bindStorage(state, getCameraStorageKey(pluginId, cameraId), client, config, () => {
         const namespaces = NamespaceManager.pluginCameraNamespaces(pluginId, cameraId);
-        return rpc.value!.createProxy<StorageRPC>(namespaces.cameraStorageRpc);
+        return client.createProxy<StorageRPC>(namespaces.cameraStorageRpc);
       });
 
       isConnected.value = true;
@@ -440,22 +457,26 @@ export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefO
     return operations.getConfig();
   }
 
-  watch(
-    [clientConnected, () => extractCameraId(toValue(camera)), () => toValue(pluginName)],
-    async ([connected, cameraId, name]) => {
-      if (connected && cameraId && name) {
-        await connect(cameraId, name);
-        // Auto-fetch config when storage connects with new params
-        operations.getConfig();
-      } else {
-        cleanupStorage(state, isConnected, config);
-      }
-      initialSetupDone.value = true;
-    },
-    { immediate: true },
-  );
+  async function sync(): Promise<void> {
+    const cameraId = extractCameraId(toValue(camera));
+    const name = toValue(pluginName);
+    if (clientConnected.value && cameraId && name) {
+      await connect(cameraId, name);
+      operations.getConfig();
+    } else {
+      cleanupStorage(state, isConnected, config);
+    }
+    initialSetupDone.value = true;
+  }
 
-  tryOnScopeDispose(() => cleanupStorage(state, isConnected, config));
+  watch([clientConnected, () => extractCameraId(toValue(camera)), () => toValue(pluginName)], sync, { immediate: true });
+
+  cameraUi.on('reconnected', sync);
+
+  tryOnScopeDispose(() => {
+    cameraUi.off('reconnected', sync);
+    cleanupStorage(state, isConnected, config);
+  });
 
   return {
     config,
@@ -470,7 +491,8 @@ export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefO
 }
 
 export function useSensorStorage(sensorId: MaybeRefOrGetter<string | undefined>, pluginId: MaybeRefOrGetter<string | undefined>): UseStorageReturn {
-  const { rpc, isConnected: clientConnected } = useCameraUi();
+  const cameraUi = useCameraUi();
+  const { rpc, isConnected: clientConnected } = cameraUi;
 
   const config = shallowRef<SchemaConfig | undefined>();
   const _isLoading = ref(false);
@@ -482,19 +504,13 @@ export function useSensorStorage(sensorId: MaybeRefOrGetter<string | undefined>,
   const operations = createStorageOperations(state, config, _isLoading, error);
 
   function connect(senId: string, plugId: string): boolean {
-    if (!rpc.value || !clientConnected.value) return false;
+    const client = rpc.value;
+    if (!client || !clientConnected.value) return false;
 
     try {
-      const storageKey = getSensorStorageKey(plugId, senId);
-
-      if (state.currentStorageKey && state.currentStorageKey !== storageKey) {
-        releaseStorage(state.currentStorageKey);
-      }
-
-      state.currentStorageKey = storageKey;
-      state.cachedStorage = acquireStorage(storageKey, () => {
+      bindStorage(state, getSensorStorageKey(plugId, senId), client, config, () => {
         const namespaces = NamespaceManager.pluginSensorNamespaces(plugId, senId);
-        return rpc.value!.createProxy<StorageRPC>(namespaces.sensorStorageRpc);
+        return client.createProxy<StorageRPC>(namespaces.sensorStorageRpc);
       });
 
       isConnected.value = true;
@@ -520,22 +536,26 @@ export function useSensorStorage(sensorId: MaybeRefOrGetter<string | undefined>,
     return operations.getConfig();
   }
 
-  watch(
-    [clientConnected, () => toValue(sensorId), () => toValue(pluginId)],
-    ([connected, senId, plugId]) => {
-      if (connected && senId && plugId) {
-        connect(senId, plugId);
-        // Auto-fetch config when storage connects with new params
-        operations.getConfig();
-      } else {
-        cleanupStorage(state, isConnected, config);
-      }
-      initialSetupDone.value = true;
-    },
-    { immediate: true },
-  );
+  function sync(): void {
+    const senId = toValue(sensorId);
+    const plugId = toValue(pluginId);
+    if (clientConnected.value && senId && plugId) {
+      connect(senId, plugId);
+      operations.getConfig();
+    } else {
+      cleanupStorage(state, isConnected, config);
+    }
+    initialSetupDone.value = true;
+  }
 
-  tryOnScopeDispose(() => cleanupStorage(state, isConnected, config));
+  watch([clientConnected, () => toValue(sensorId), () => toValue(pluginId)], sync, { immediate: true });
+
+  cameraUi.on('reconnected', sync);
+
+  tryOnScopeDispose(() => {
+    cameraUi.off('reconnected', sync);
+    cleanupStorage(state, isConnected, config);
+  });
 
   return {
     config,
