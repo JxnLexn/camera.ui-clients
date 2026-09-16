@@ -34,7 +34,7 @@ export interface CameraUiContext {
   off: (event: CameraUiEventType, cb: CameraUiEventCallback) => void;
 }
 
-export interface ReactiveCoreManager extends Omit<ICoreManager, 'connectToPlugin' | 'signRequest' | 'onEvent'> {}
+export interface ReactiveCoreManager extends Omit<ICoreManager, 'connectToPlugin' | 'signRequest' | 'onEvent' | 'assistantAsk' | 'assistantAccess'> {}
 
 export interface ReactiveDeviceManager {
   getCamera: (cameraIdOrName: string) => Promise<ReactiveCameraDevice | undefined>;
