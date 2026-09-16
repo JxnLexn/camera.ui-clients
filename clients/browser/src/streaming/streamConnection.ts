@@ -31,6 +31,8 @@ export interface StreamConnectionOptions {
 
 const log = new Logger('StreamConnection');
 
+const MSE_AUDIO_CODEC = /mp4a|opus|flac|mp3/i;
+
 function isVideoInPictureInPicture(video: HTMLVideoElement | undefined | null): boolean {
   if (!video) return false;
   if (typeof document !== 'undefined' && 'pictureInPictureElement' in document && document.pictureInPictureElement === video) {
@@ -804,6 +806,12 @@ export class StreamConnection implements ReactiveStream {
     this.restart();
   }
 
+  private noteDeliveredAudio(delivered: boolean): void {
+    if (delivered && !this.hasAudio.value) {
+      this.hasAudio.value = true;
+    }
+  }
+
   private async probeStream(): Promise<ProbeStream | undefined> {
     const cam = this.camera.value;
     const source = this.source.value;
@@ -924,6 +932,7 @@ export class StreamConnection implements ReactiveStream {
 
       case 'mse':
         if (this.mseHandler && typeof msg.value === 'string') {
+          this.noteDeliveredAudio(MSE_AUDIO_CODEC.test(msg.value));
           this.mseHandler.initializeBuffer(msg.value);
         }
         break;
@@ -969,6 +978,8 @@ export class StreamConnection implements ReactiveStream {
       this.handleWebRTCFailed();
       return;
     }
+
+    this.noteDeliveredAudio(stream.getAudioTracks().length > 0);
 
     // connectTimeout keeps running as a first-frame watchdog (a connected
     // H.265 track can still decode to nothing) — handleFirstFrame stops it
