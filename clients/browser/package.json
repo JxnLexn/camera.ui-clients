@@ -52,7 +52,7 @@
     "@vue/language-core": "^3.3.11",
     "@vue/tsconfig": "^0.9.1",
     "@vueuse/core": "^15.0.0",
-    "@webgpu/types": "^0.1.73",
+    "@webgpu/types": "^0.1.74",
     "eslint": "9.39.2",
     "eslint-plugin-vue": "^10.11.0",
     "globals": "^17.12.0",
