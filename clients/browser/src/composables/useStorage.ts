@@ -363,12 +363,10 @@ export function usePluginStorage(pluginName: MaybeRefOrGetter<string>): UseStora
   }
 
   async function getConfig(): Promise<SchemaConfig | undefined> {
-    if (!state.cachedStorage) {
-      const name = toValue(pluginName);
-      if (!name) return undefined;
-      const connected = await connect(name);
-      if (!connected) return undefined;
-    }
+    const name = toValue(pluginName);
+    if (!name) return undefined;
+    const connected = await connect(name);
+    if (!connected) return undefined;
     return operations.getConfig();
   }
 
@@ -449,10 +447,8 @@ export function useCameraStorage(camera: CameraIdentifier, pluginName: MaybeRefO
 
     if (!cameraId || !name) return undefined;
 
-    if (!state.cachedStorage) {
-      const connected = await connect(cameraId, name);
-      if (!connected) return undefined;
-    }
+    const connected = await connect(cameraId, name);
+    if (!connected) return undefined;
 
     return operations.getConfig();
   }
@@ -528,10 +524,8 @@ export function useSensorStorage(sensorId: MaybeRefOrGetter<string | undefined>,
 
     if (!senId || !plugId) return undefined;
 
-    if (!state.cachedStorage) {
-      const connected = connect(senId, plugId);
-      if (!connected) return undefined;
-    }
+    const connected = connect(senId, plugId);
+    if (!connected) return undefined;
 
     return operations.getConfig();
   }
