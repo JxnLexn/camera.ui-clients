@@ -209,15 +209,17 @@ export function useSnapshot(cameraIdOrName: MaybeRefOrGetter<string | DBCamera>)
     }
   }
 
+  function showCached(id: string): boolean {
+    const cached = snapshotCache.get(id);
+    if (!cached) return false;
+    snapshot.value = cached;
+    initialLoadDone.value = true;
+    return true;
+  }
+
   async function loadSnapshot(id: string, skipCache = false): Promise<void> {
     if (!isConnected.value || !id) return;
-
-    const cached = skipCache ? undefined : snapshotCache.get(id);
-    if (cached) {
-      snapshot.value = cached;
-      initialLoadDone.value = true;
-      return;
-    }
+    if (!skipCache && showCached(id)) return;
 
     _isLoading.value = true;
     try {
@@ -266,6 +268,8 @@ export function useSnapshot(cameraIdOrName: MaybeRefOrGetter<string | DBCamera>)
 
       if (connected && id && !disabled) {
         unsubscribe = subscribe(id);
+        // holding the device is a round trip, a remounted card shows its cached snapshot right away
+        showCached(id);
         await holdDevice(id);
         await loadSnapshot(id);
       } else if (id) {
